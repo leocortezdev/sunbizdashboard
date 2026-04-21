@@ -1,0 +1,4 @@
+streamlit>=1.35.0
+pandas>=2.0.0
+paramiko>=3.4.0
+resend>=2.0.0
