@@ -123,7 +123,11 @@ def db_connect() -> sqlite3.Connection:
 
 
 def db_migrate():
-    """Safely add new columns and clean up bad records from previous imports."""
+    """
+    Safely add new columns and clean up bad records.
+    Split into two separate connections — SQLite does not allow DDL (ALTER TABLE)
+    and DML (DELETE) in the same transaction, which causes OperationalError on commit.
+    """
     migrations = [
         "ALTER TABLE leads ADD COLUMN principal_phone TEXT",
         "ALTER TABLE leads ADD COLUMN enriched_at TEXT",
@@ -134,25 +138,42 @@ def db_migrate():
         "ALTER TABLE leads ADD COLUMN google_search_done INTEGER DEFAULT 0",
         "ALTER TABLE leads ADD COLUMN is_active_business INTEGER DEFAULT 0",
     ]
-    with db_connect() as conn:
+
+    # ── Pass 1: Schema changes (ALTER TABLE) ──────────────────────────────
+    conn = db_connect()
+    try:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
         for sql in migrations:
             col = sql.split("ADD COLUMN")[1].strip().split()[0]
             if col not in existing:
                 try:
                     conn.execute(sql)
+                    conn.commit()
                 except Exception:
                     pass
+    finally:
+        conn.close()
 
-        # ── Purge bad records from previous imports ──────────────────────
-        # Remove non-Active status records
-        conn.execute("DELETE FROM leads WHERE status != 'A' AND status IS NOT NULL AND status != ''")
-        # Remove foreign entity types that don't owe FL annual reports
-        foreign_types = ("'RL'","'RP'","'ML'","'MP'","'MN'")
-        conn.execute(f"DELETE FROM leads WHERE record_type IN ({','.join(foreign_types)})")
-        # Remove 2026 registrations — they don't owe a report until May 1, 2027
-        conn.execute("DELETE FROM leads WHERE last_rpt_year >= 2026")
+    # ── Pass 2: Data cleanup (DELETE) — fresh connection ─────────────────
+    conn = db_connect()
+    try:
+        foreign_types = "'RL','RP','ML','MP','MN'"
+        cleanups = [
+            # Non-active status
+            "DELETE FROM leads WHERE status != 'A' AND status IS NOT NULL AND status != ''",
+            # Foreign entity types
+            f"DELETE FROM leads WHERE record_type IN ({foreign_types})",
+            # 2026 registrations — first report not due until May 1 2027
+            "DELETE FROM leads WHERE last_rpt_year >= 2026",
+        ]
+        for sql in cleanups:
+            try:
+                conn.execute(sql)
+            except Exception:
+                pass
         conn.commit()
+    finally:
+        conn.close()
 
 
 def db_init():
