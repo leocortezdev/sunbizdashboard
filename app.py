@@ -10,7 +10,6 @@ import os
 import io
 import time
 import sqlite3
-import threading
 import textwrap
 import random
 from datetime import datetime, date
@@ -237,15 +236,10 @@ def parse_fw_buffer(data: bytes, source_file: str = "") -> list:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MODULE 1 — SFTP Pipeline (background thread)
+#  MODULE 1 — SFTP Pipeline (runs synchronously in main thread via st.status)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.pipeline_logs.append(f"[{ts}] {msg}")
-
-
-def _latest_file(sftp: paramiko.SFTPClient, remote_dir: str) -> Optional[str]:
+def _latest_file(sftp: paramiko.SFTPClient, remote_dir: str, status_write) -> Optional[str]:
     try:
         attrs = sftp.listdir_attr(remote_dir)
         if not attrs:
@@ -253,7 +247,7 @@ def _latest_file(sftp: paramiko.SFTPClient, remote_dir: str) -> Optional[str]:
         attrs.sort(key=lambda a: a.st_mtime or 0, reverse=True)
         return remote_dir + attrs[0].filename
     except Exception as e:
-        _log(f"⚠  Cannot list {remote_dir}: {e}")
+        status_write(f"⚠  Cannot list {remote_dir}: {e}")
         return None
 
 
@@ -283,65 +277,76 @@ def _generate_mock(n: int = 350) -> list:
     return records
 
 
-def run_pipeline():
-    st.session_state.pipeline_running  = True
-    st.session_state.pipeline_complete = False
-    st.session_state.pipeline_logs     = []
-    st.session_state.pipeline_error    = None
-
+def run_pipeline_sync():
+    """
+    Runs the full pipeline synchronously inside an st.status() context so
+    Streamlit can stream live updates without threading issues.
+    Call this directly from the button handler — no threads needed.
+    """
     all_records = []
+    logs = []
 
-    try:
-        _log(f"🔐 Connecting to {SFTP_HOST}:{SFTP_PORT} as '{SFTP_USER}' …")
-        transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
-        transport.connect(username=SFTP_USER, password=SFTP_PASS)
-        sftp = paramiko.SFTPClient.from_transport(transport)
-        _log("✅ SFTP connection established.")
+    with st.status("Running pipeline…", expanded=True) as status:
+        def w(msg):
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"[{ts}] {msg}"
+            logs.append(line)
+            status.write(line)
 
-        for label, remote_dir in [("Corporations (COR)", COR_PATH),
-                                   ("LLCs (LLC)",         LLC_PATH)]:
-            _log(f"📂 Scanning {label} → {remote_dir}")
-            path = _latest_file(sftp, remote_dir)
-            if not path:
-                _log(f"⚠  No files in {remote_dir}, skipping.")
-                continue
-            filename = path.split("/")[-1]
-            _log(f"⬇  Downloading: {filename}")
-            buf = io.BytesIO()
-            sftp.getfo(path, buf)
-            buf.seek(0)
-            raw = buf.read()
-            _log(f"📦 {len(raw)/1024:,.1f} KB received — parsing …")
-            recs = parse_fw_buffer(raw, source_file=filename)
-            _log(f"🎯 {len(recs):,} delinquent Active records in {filename}")
-            all_records.extend(recs)
+        try:
+            w(f"🔐 Connecting to {SFTP_HOST}:{SFTP_PORT} as '{SFTP_USER}' …")
+            transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
+            transport.connect(username=SFTP_USER, password=SFTP_PASS)
+            sftp = paramiko.SFTPClient.from_transport(transport)
+            w("✅ SFTP connection established.")
 
-        sftp.close()
-        transport.close()
-        _log("🔌 SFTP closed.")
+            for label, remote_dir in [("Corporations (COR)", COR_PATH),
+                                       ("LLCs (LLC)",         LLC_PATH)]:
+                w(f"📂 Scanning {label} → {remote_dir}")
+                path = _latest_file(sftp, remote_dir, w)
+                if not path:
+                    w(f"⚠  No files found in {remote_dir}, skipping.")
+                    continue
+                filename = path.split("/")[-1]
+                w(f"⬇  Downloading: {filename}")
+                buf = io.BytesIO()
+                sftp.getfo(path, buf)
+                buf.seek(0)
+                raw = buf.read()
+                w(f"📦 {len(raw)/1024:,.1f} KB received — parsing …")
+                recs = parse_fw_buffer(raw, source_file=filename)
+                w(f"🎯 {len(recs):,} delinquent Active records found in {filename}")
+                all_records.extend(recs)
 
-    except paramiko.AuthenticationException:
-        st.session_state.pipeline_error = "Authentication failed."
-        _log("❌ Auth failed.")
-        st.session_state.pipeline_running = False
-        return
-    except Exception as e:
-        _log(f"⚠  Live SFTP unavailable ({type(e).__name__}). Loading mock dataset …")
-        time.sleep(1.2)
-        all_records = _generate_mock(350)
-        _log(f"✅ Mock dataset ready — {len(all_records):,} records.")
+            sftp.close()
+            transport.close()
+            w("🔌 SFTP connection closed.")
 
-    if all_records:
-        _log(f"💾 Upserting {len(all_records):,} leads …")
-        inserted, skipped = db_upsert_leads(all_records)
-        _log(f"✅ Inserted: {inserted:,}  |  Skipped (dup): {skipped:,}")
-    else:
-        _log("ℹ  No new delinquent records found.")
+        except paramiko.AuthenticationException:
+            w("❌ Authentication failed — check SFTP credentials in sidebar.")
+            status.update(label="Pipeline failed", state="error", expanded=True)
+            st.session_state.pipeline_logs = logs
+            return
 
-    st.session_state.pipeline_running  = False
+        except Exception as e:
+            w(f"⚠  Live SFTP unavailable ({type(e).__name__}: {e})")
+            w("🔄 Falling back to mock dataset for demonstration …")
+            all_records = _generate_mock(350)
+            w(f"✅ Mock dataset ready — {len(all_records):,} records.")
+
+        if all_records:
+            w(f"💾 Upserting {len(all_records):,} leads into SQLite …")
+            inserted, skipped = db_upsert_leads(all_records)
+            w(f"✅ Inserted: {inserted:,}  |  Duplicates skipped: {skipped:,}")
+        else:
+            w("ℹ  No new delinquent records found.")
+
+        w("🏁 Pipeline complete.")
+        status.update(label="✅ Pipeline complete", state="complete", expanded=False)
+
+    st.session_state.pipeline_logs     = logs
     st.session_state.pipeline_complete = True
     st.session_state.last_pipeline_run = datetime.now().strftime("%b %d, %Y at %I:%M %p")
-    _log("🏁 Pipeline complete.")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -515,10 +520,8 @@ hr{ border-color:var(--border)!important; }
 #  SESSION STATE
 # ═════════════════════════════════════════════════════════════════════════════
 _DEFAULTS = {
-    "pipeline_running" : False,
     "pipeline_complete": False,
     "pipeline_logs"    : [],
-    "pipeline_error"   : None,
     "last_pipeline_run": None,
     "selected_entity"  : None,
     "email_sent_ids"   : set(),
@@ -587,33 +590,17 @@ with hc2:
         "▶  Run Pipeline",
         type="primary",
         use_container_width=True,
-        disabled=st.session_state.pipeline_running,
         help="SFTP download → parse fixed-width → filter delinquents → SQLite upsert",
     )
 
-if run_btn and not st.session_state.pipeline_running:
-    threading.Thread(target=run_pipeline, daemon=True).start()
+if run_btn:
+    run_pipeline_sync()
     st.rerun()
 
-# Live log
-if st.session_state.pipeline_running or (
-    st.session_state.pipeline_logs and not st.session_state.pipeline_complete
-):
-    log_html = "\n".join(st.session_state.pipeline_logs) or "Initializing…"
-    st.markdown(f'<div class="log-term">{log_html}</div>', unsafe_allow_html=True)
-    if st.session_state.pipeline_running:
-        time.sleep(1.2)
-        st.rerun()
-
-if st.session_state.pipeline_error:
-    st.error(f"Pipeline error: {st.session_state.pipeline_error}")
-
 if st.session_state.pipeline_complete and st.session_state.pipeline_logs:
-    with st.expander("📋 Pipeline Log", expanded=False):
-        st.markdown(
-            f'<div class="log-term">{"chr(10)".join(st.session_state.pipeline_logs)}</div>',
-            unsafe_allow_html=True
-        )
+    with st.expander("📋 Last Pipeline Log", expanded=False):
+        log_html = "\n".join(st.session_state.pipeline_logs)
+        st.markdown(f'<div class="log-term">{log_html}</div>', unsafe_allow_html=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
