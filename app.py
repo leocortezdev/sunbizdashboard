@@ -104,6 +104,24 @@ def db_connect() -> sqlite3.Connection:
     return conn
 
 
+def db_migrate():
+    """Safely add new columns to existing tables without dropping data."""
+    migrations = [
+        "ALTER TABLE leads ADD COLUMN principal_phone TEXT",
+        "ALTER TABLE leads ADD COLUMN enriched_at TEXT",
+    ]
+    with db_connect() as conn:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
+        for sql in migrations:
+            col = sql.split("ADD COLUMN")[1].strip().split()[0]
+            if col not in existing:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+        conn.commit()
+
+
 def db_init():
     with db_connect() as conn:
         conn.execute("""
@@ -138,6 +156,7 @@ def db_init():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_cs ON leads(contact_status)")
         conn.commit()
+    db_migrate()  # safe every startup — skips already-existing columns
 
 
 def db_upsert_leads(records: list) -> tuple:
