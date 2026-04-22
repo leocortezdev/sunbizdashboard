@@ -1073,17 +1073,24 @@ def run_pipeline_sync():
                 reverse=True,   # NEWEST first — recent registrations are far more likely active
             )
 
-            # ── Start date filter ─────────────────────────────────────────
-            # Only pull files on or after the cutoff date set in sidebar.
-            # Default: 2025-01-01 — companies registered in the last ~16 months
-            # are much more likely to still be active vs 2022-era registrations.
+            # ── Date window filter ────────────────────────────────────────
+            # START: set in sidebar (default Jan 1 2025)
+            # END:   always capped at Dec 31 2025 — files from 2026 onward contain
+            #        brand-new 2026 registrations which don't owe a report until 2027.
+            #        Downloading those files wastes runs and produces zero usable leads.
             start_cutoff = st.session_state.get("pipeline_start_date", "20250101")
-            daily = [a for a in all_daily if a.filename[:8] >= start_cutoff]
+            end_cutoff   = "20251231"   # hard cap — never pull 2026 registration files
+
+            daily = [
+                a for a in all_daily
+                if start_cutoff <= a.filename[:8] <= end_cutoff
+            ]
 
             w(f"📂 Found {len(all_daily):,} total files on server")
-            w(f"   Filtered to {len(daily):,} files from {start_cutoff[:4]}-{start_cutoff[4:6]}-{start_cutoff[6:]} onward")
+            w(f"   Window: {start_cutoff[:4]}-{start_cutoff[4:6]}-{start_cutoff[6:]} → 2025-12-31")
+            w(f"   Files in window: {len(daily):,}")
             if daily:
-                w(f"   Newest: {daily[0].filename}  |  Oldest in range: {daily[-1].filename}")
+                w(f"   Newest in range: {daily[0].filename}  |  Oldest: {daily[-1].filename}")
 
             # ── Cursor: skip files already downloaded ─────────────────────
             already_done = db_get_downloaded_files()
@@ -1378,29 +1385,31 @@ with st.sidebar:
 
     st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>PIPELINE SETTINGS</div>', unsafe_allow_html=True)
 
-    # Date range — default to Jan 1 2025 so we only pull recent, high-quality leads
     from datetime import date as _date
+    # Hard boundaries:
+    #   Start — configurable (default Jan 1 2025 for freshest leads)
+    #   End   — always Dec 31 2025 (2026 files = new registrations, no report due until 2027)
     default_start = _date(2025, 1, 1)
+    end_cap       = _date(2025, 12, 31)
+
     start_date = st.date_input(
-        "Only pull files from",
+        "Pull files starting from",
         value=default_start,
         min_value=_date(2022, 11, 1),
-        max_value=_date.today(),
+        max_value=end_cap,
         key="pipeline_start_date_picker",
-        help="Pull files from this date onward. "
-             "Jan 1 2025 is the sweet spot — these businesses owe a 2026 annual report "
-             "(registered in 2025 or earlier) and are recent enough to likely still be active. "
-             "Do NOT go back to 2026 files — those are new registrations exempt from 2026 reporting."
+        help="Files are always capped at Dec 31 2025. "
+             "2026 registration files are excluded — those businesses don't owe "
+             "an annual report until May 1, 2027."
     )
-    # Store as YYYYMMDD string for filename comparison
     start_date_str = start_date.strftime("%Y%m%d")
     st.session_state["pipeline_start_date"] = start_date_str
 
-    # Estimate how many files are in range
-    days_in_range = (_date.today() - start_date).days
-    est_files     = int(days_in_range * 0.71)   # ~5 files/week
+    days_in_range = (end_cap - start_date).days
+    est_files     = max(1, int(days_in_range * 0.71))
     est_leads     = est_files * 2500
-    st.caption(f"≈ {est_files:,} files · {est_leads:,} businesses in selected range")
+    st.caption(f"Window: {start_date.strftime('%b %d %Y')} → Dec 31 2025")
+    st.caption(f"≈ {est_files:,} files · {est_leads:,} potential leads")
 
     pipeline_num_files = st.slider("Files per run", 1, 30, 5, key="pipeline_num_files",
                                     help="How many daily files to download each time you click Run Pipeline")
