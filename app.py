@@ -82,6 +82,21 @@ FW = {
 }
 FW_MIN_LEN = 480
 
+# ── Entity types that owe Florida annual reports ──────────────────────────────
+# These are Florida-domestic entities required to file annually.
+# Foreign entities (RL, RP, ML, MP, MN) file differently and are excluded.
+VALID_ENTITY_TYPES = {
+    "AL",   # Florida LLC
+    "CP",   # Florida Corporation
+    "PA",   # Professional Association
+    "NP",   # Non-Profit Corporation
+    "LP",   # Limited Partnership
+    "PL",   # Professional LLC
+}
+
+# Status codes that mean "active and operating"
+VALID_STATUS_CODES = {"A"}   # A = Active. I = Inactive, D = Dissolved, V = Vol. Dissolved
+
 
 def extract_reg_year(record: bytes) -> int:
     """Extract registration year from filed_date (MMDDYYYY at offset 472)."""
@@ -105,7 +120,7 @@ def db_connect() -> sqlite3.Connection:
 
 
 def db_migrate():
-    """Safely add new columns to existing tables without dropping data."""
+    """Safely add new columns and clean up bad records from previous imports."""
     migrations = [
         "ALTER TABLE leads ADD COLUMN principal_phone TEXT",
         "ALTER TABLE leads ADD COLUMN enriched_at TEXT",
@@ -125,6 +140,13 @@ def db_migrate():
                     conn.execute(sql)
                 except Exception:
                     pass
+
+        # ── Purge inactive / foreign entity records from previous imports ──
+        # Remove any record that is not Active status
+        conn.execute("DELETE FROM leads WHERE status != 'A' AND status IS NOT NULL AND status != ''")
+        # Remove foreign entity types that don't owe FL annual reports
+        foreign_types = ("'RL'","'RP'","'ML'","'MP'","'MN'")
+        conn.execute(f"DELETE FROM leads WHERE record_type IN ({','.join(foreign_types)})")
         conn.commit()
 
 
@@ -375,10 +397,19 @@ def parse_record(line: bytes, source_file: str = "") -> Optional[dict]:
     if len(rec) < FW_MIN_LEN:
         return None
 
-    entity_name = _s(rec, 12, 192)
-    status      = _s(rec, 204, 1)
+    entity_name  = _s(rec, 12,  192)
+    status       = _s(rec, 204,   1)
+    entity_type  = _s(rec, 207,   2)
 
-    if not entity_name or status != "A":
+    # Must be Active
+    if status not in VALID_STATUS_CODES:
+        return None
+
+    # Must be a Florida-domestic entity type that owes annual reports
+    if entity_type not in VALID_ENTITY_TYPES:
+        return None
+
+    if not entity_name:
         return None
 
     reg_year = extract_reg_year(rec)
@@ -798,25 +829,31 @@ def _latest_file(sftp: paramiko.SFTPClient, remote_dir: str, status_write) -> Op
 
 
 def _generate_mock(n: int = 350) -> list:
-    biz_types  = ["LLC","CORP","INC","PA","PL","LLP"]
-    first_names= ["James","Maria","Robert","Linda","Michael","Patricia",
-                  "Carlos","Ana","David","Jennifer","Luis","Sofia"]
-    last_names = ["Smith","Johnson","Williams","Garcia","Martinez","Rodriguez",
-                  "Brown","Jones","Davis","Miller","Wilson","Taylor"]
+    # Only use valid FL domestic entity types — same filter as the real parser
+    valid_types = list(VALID_ENTITY_TYPES)
+    first_names = ["James","Maria","Robert","Linda","Michael","Patricia",
+                   "Carlos","Ana","David","Jennifer","Luis","Sofia"]
+    last_names  = ["Smith","Johnson","Williams","Garcia","Martinez","Rodriguez",
+                   "Brown","Jones","Davis","Miller","Wilson","Taylor"]
+    fl_cities   = ["Miami","Orlando","Tampa","Jacksonville","Fort Lauderdale",
+                   "Boca Raton","Naples","Sarasota","Gainesville","Tallahassee"]
     records = []
     for i in range(n):
-        fn, ln = random.choice(first_names), random.choice(last_names)
-        yr     = random.choice([2022,2023,2024,2025])
-        num    = f"L{random.randint(10000000,99999999)}"
+        fn, ln  = random.choice(first_names), random.choice(last_names)
+        etype   = random.choice(valid_types)
+        yr      = random.choice([2022, 2023, 2024, 2025])
+        city    = random.choice(fl_cities)
+        num     = f"L{random.randint(10000000,99999999)}"
+        suffix  = {"AL":"LLC","CP":"CORP","PA":"P.A.","NP":"INC","LP":"LP","PL":"PLLC"}.get(etype,"LLC")
         records.append({
-            "record_type"    : random.choice(["LC","CP"]),
+            "record_type"    : etype,
             "entity_number"  : num,
-            "status"         : "A",
-            "filing_date"    : f"20{random.randint(10,22):02d}0{random.randint(1,9)}01",
-            "entity_name"    : f"{ln} {random.choice(biz_types)} {i+1}",
+            "status"         : "A",          # always Active in mock data
+            "filing_date"    : f"0{random.randint(1,9)}{random.randint(10,28)}{yr}",
+            "entity_name"    : f"{ln} {suffix} {i+1}",
             "last_rpt_year"  : yr,
-            "principal_addr" : f"{random.randint(100,9999)} {ln} BLVD, MIAMI FL",
-            "principal_email": f"{fn.lower()}.{ln.lower()}{random.randint(1,99)}@gmail.com",
+            "principal_addr" : f"{random.randint(100,9999)} {ln} BLVD, {city} FL",
+            "principal_email": "",           # blank — like real data, enriched separately
             "owner_name"     : f"{fn} {ln}",
             "source_file"    : "MOCK_DATA",
         })
