@@ -125,8 +125,8 @@ def db_connect() -> sqlite3.Connection:
 def db_migrate():
     """
     Safely add new columns and clean up bad records.
-    Split into two separate connections — SQLite does not allow DDL (ALTER TABLE)
-    and DML (DELETE) in the same transaction, which causes OperationalError on commit.
+    Uses isolation_level=None (autocommit) to avoid transaction conflicts
+    between DDL (ALTER TABLE) and DML (DELETE) statements.
     """
     migrations = [
         "ALTER TABLE leads ADD COLUMN principal_phone TEXT",
@@ -139,39 +139,31 @@ def db_migrate():
         "ALTER TABLE leads ADD COLUMN is_active_business INTEGER DEFAULT 0",
     ]
 
-    # ── Pass 1: Schema changes (ALTER TABLE) ──────────────────────────────
-    conn = db_connect()
+    # Use autocommit mode — no transaction wrapper, each statement executes immediately
+    conn = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
     try:
+        # ── Schema changes ────────────────────────────────────────────────
         existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
         for sql in migrations:
             col = sql.split("ADD COLUMN")[1].strip().split()[0]
             if col not in existing:
                 try:
                     conn.execute(sql)
-                    conn.commit()
-                except Exception:
-                    pass
-    finally:
-        conn.close()
+                except sqlite3.OperationalError:
+                    pass  # column already exists — safe to ignore
 
-    # ── Pass 2: Data cleanup (DELETE) — fresh connection ─────────────────
-    conn = db_connect()
-    try:
+        # ── Data cleanup ──────────────────────────────────────────────────
         foreign_types = "'RL','RP','ML','MP','MN'"
         cleanups = [
-            # Non-active status
             "DELETE FROM leads WHERE status != 'A' AND status IS NOT NULL AND status != ''",
-            # Foreign entity types
             f"DELETE FROM leads WHERE record_type IN ({foreign_types})",
-            # 2026 registrations — first report not due until May 1 2027
             "DELETE FROM leads WHERE last_rpt_year >= 2026",
         ]
         for sql in cleanups:
             try:
                 conn.execute(sql)
-            except Exception:
-                pass
-        conn.commit()
+            except sqlite3.OperationalError:
+                pass  # table may not exist yet on first run
     finally:
         conn.close()
 
