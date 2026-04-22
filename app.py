@@ -52,7 +52,9 @@ ZIP_CHUNK_SIZE   = 256 * 1024   # 256 KB per chunk
 DB_PATH      = "sunbiz_leads.db"
 PENALTY_FEE  = 400
 DEADLINE     = "May 1, 2026"
-CURRENT_YEAR = 2026
+CURRENT_YEAR = 2026   # Reporting year — entities registered BEFORE this year owe the annual report.
+                      # Florida law: register in 2026 → first report due May 1, 2027 (not 2026).
+                      # So valid leads = registered 2025 or earlier, still Active status.
 
 # ─── Confirmed field offsets (verified against real 20240919c.txt sample) ────
 # Source: /Public/doc/cor/2021/ daily registration files (YYYYMMDDc.txt)
@@ -142,12 +144,14 @@ def db_migrate():
                 except Exception:
                     pass
 
-        # ── Purge inactive / foreign entity records from previous imports ──
-        # Remove any record that is not Active status
+        # ── Purge bad records from previous imports ──────────────────────
+        # Remove non-Active status records
         conn.execute("DELETE FROM leads WHERE status != 'A' AND status IS NOT NULL AND status != ''")
         # Remove foreign entity types that don't owe FL annual reports
         foreign_types = ("'RL'","'RP'","'ML'","'MP'","'MN'")
         conn.execute(f"DELETE FROM leads WHERE record_type IN ({','.join(foreign_types)})")
+        # Remove 2026 registrations — they don't owe a report until May 1, 2027
+        conn.execute("DELETE FROM leads WHERE last_rpt_year >= 2026")
         conn.commit()
 
 
@@ -330,13 +334,24 @@ def db_delete_lead(entity_number: str, reason: str = ""):
 # Shared state between background thread and Streamlit UI
 _BG = {
     "running"      : False,
-    "current"      : "",      # entity name being checked right now
+    "current"      : "",
     "checked"      : 0,
     "removed"      : 0,
     "emails_found" : 0,
     "phones_found" : 0,
-    "last_action"  : "",      # last thing that happened (for live log)
+    "last_action"  : "",
+    "log"          : [],      # rolling last-20 activity lines
+    "started_at"   : None,
 }
+
+def _bg_log(msg: str):
+    """Add a line to the rolling activity log (max 20 entries)."""
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    _BG["log"].append(entry)
+    if len(_BG["log"]) > 20:
+        _BG["log"].pop(0)
+    _BG["last_action"] = msg
 _BG_LOCK = threading.Lock()
 
 
@@ -369,24 +384,26 @@ def _bg_enrich_worker(delay_sec: float = 2.0):
             _BG["checked"] += 1
 
             if not data["page_found"] or data["is_inactive"]:
-                # Delete silently — it just disappears from the table
                 reason = data.get("live_status") or "Not found / Inactive"
                 db_delete_lead(entity_num, reason=reason)
-                _BG["removed"]    += 1
-                _BG["last_action"] = f"🗑 Removed: {entity_name[:40]} ({reason})"
+                _BG["removed"] += 1
+                _bg_log(f"🗑  REMOVED  {entity_name[:45]}  ({reason})")
             else:
                 db_enrich_lead(entity_num, data.get("email",""), data.get("phone",""))
-                if data.get("email"):    _BG["emails_found"] += 1
-                if data.get("phone"):    _BG["phones_found"] += 1
-                action = []
-                if data.get("email"):  action.append(f"✉ {data['email']}")
-                if data.get("phone"):  action.append(f"📞 {data['phone']}")
-                _BG["last_action"] = f"✅ {entity_name[:35]} — " + (", ".join(action) if action else "no contact info")
+                if data.get("email"):  _BG["emails_found"] += 1
+                if data.get("phone"):  _BG["phones_found"] += 1
+                parts = []
+                if data.get("email"):  parts.append(f"✉ {data['email']}")
+                if data.get("phone"):  parts.append(f"📞 {data['phone']}")
+                suffix = "  ·  " + "  ".join(parts) if parts else "  ·  no contact info"
+                _bg_log(f"✅  ACTIVE   {entity_name[:45]}{suffix}")
 
         time.sleep(delay_sec)
 
     with _BG_LOCK:
         _BG["running"] = False
+        _bg_log(f"🏁 Complete — {_BG['checked']} checked, {_BG['removed']} removed, "
+                f"{_BG['emails_found']} emails, {_BG['phones_found']} phones")
 
 
 def start_bg_enrichment(delay_sec: float = 2.0):
@@ -515,8 +532,15 @@ def parse_record(line: bytes, source_file: str = "") -> Optional[dict]:
 
     reg_year = extract_reg_year(rec)
 
-    # Entities registered THIS year are brand new — they don't owe a report yet
+    # Florida law: entities registered in CURRENT_YEAR don't owe their first
+    # annual report until Jan 1 – May 1 of the FOLLOWING year.
+    # So for 2026: only entities registered in 2025 or earlier owe a 2026 report.
+    # Entities registered in 2026 are EXCLUDED — they owe nothing until 2027.
     if reg_year >= CURRENT_YEAR:
+        return None
+
+    # Also exclude entities with no registration year — data quality issue
+    if reg_year == 0:
         return None
 
     owner_first = _s(rec, 564, 15)
@@ -996,7 +1020,7 @@ def _generate_mock(n: int = 350) -> list:
     for i in range(n):
         fn, ln  = random.choice(first_names), random.choice(last_names)
         etype   = random.choice(valid_types)
-        yr      = random.choice([2022, 2023, 2024, 2025])
+        yr      = random.choice([2023, 2024, 2025, 2025])   # 2025 or earlier — these owe 2026 annual report
         city    = random.choice(fl_cities)
         num     = f"L{random.randint(10000000,99999999)}"
         suffix  = {"AL":"LLC","CP":"CORP","PA":"P.A.","NP":"INC","LP":"LP","PL":"PLLC"}.get(etype,"LLC")
@@ -1042,15 +1066,24 @@ def run_pipeline_sync():
             remote_dir = "/Public/doc/cor/"
             attrs = sftp.listdir_attr(remote_dir)
 
-            # Keep only YYYYMMDDc.txt files, sort OLDEST first so we
-            # process chronologically and the cursor always moves forward
-            daily = sorted(
+            # Keep only YYYYMMDDc.txt files
+            all_daily = sorted(
                 [a for a in attrs if a.filename.endswith("c.txt") and a.filename[:4].isdigit()],
                 key=lambda a: a.filename,
+                reverse=True,   # NEWEST first — recent registrations are far more likely active
             )
 
-            w(f"📂 Found {len(daily):,} daily files on server")
-            w(f"   Range: {daily[0].filename} → {daily[-1].filename}")
+            # ── Start date filter ─────────────────────────────────────────
+            # Only pull files on or after the cutoff date set in sidebar.
+            # Default: 2025-01-01 — companies registered in the last ~16 months
+            # are much more likely to still be active vs 2022-era registrations.
+            start_cutoff = st.session_state.get("pipeline_start_date", "20250101")
+            daily = [a for a in all_daily if a.filename[:8] >= start_cutoff]
+
+            w(f"📂 Found {len(all_daily):,} total files on server")
+            w(f"   Filtered to {len(daily):,} files from {start_cutoff[:4]}-{start_cutoff[4:6]}-{start_cutoff[6:]} onward")
+            if daily:
+                w(f"   Newest: {daily[0].filename}  |  Oldest in range: {daily[-1].filename}")
 
             # ── Cursor: skip files already downloaded ─────────────────────
             already_done = db_get_downloaded_files()
@@ -1060,19 +1093,19 @@ def run_pipeline_sync():
             w(f"   New files to fetch: {len(new_files):,} files")
 
             if not new_files:
-                w("✅ Already up to date — no new files on server.")
+                w("✅ All files in date range already downloaded.")
                 sftp.close()
                 transport.close()
                 w("🔌 SFTP connection closed.")
                 all_records = []
             else:
-                # Batch size from sidebar — how many new files per run
+                # Batch size from sidebar
                 num_files = st.session_state.get("pipeline_num_files", 5)
-                target    = new_files[:num_files]   # oldest-first batch of N new files
+                target    = new_files[:num_files]   # newest-first batch of N new files
 
                 if len(new_files) > num_files:
                     w(f"⏭  Processing {num_files} of {len(new_files)} new files this run")
-                    w(f"   ({len(new_files) - num_files} more will be picked up on next run)")
+                    w(f"   ({len(new_files) - num_files} more on next run)")
                 else:
                     w(f"⬇  Downloading all {len(target)} new files …")
 
@@ -1143,9 +1176,9 @@ def build_email(entity_name, owner_name, last_rpt_year, entity_number) -> str:
     return textwrap.dedent(f"""\
         Dear {owner},
 
-        I'm reaching out because {entity_name} (Entity # {entity_number}) appears
-        in Florida's public Sunbiz records as Active but without a 2026 Annual
-        Report on file with the Division of Corporations.
+        I'm reaching out because {entity_name} (Entity # {entity_number}) is
+        listed as Active in Florida's public Sunbiz records, and based on your
+        registration date your 2026 Annual Report appears to still be pending.
 
         ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
           DEADLINE  :  {DEADLINE}
@@ -1344,9 +1377,34 @@ with st.sidebar:
     st.text_input("From Address", placeholder="you@yourdomain.com", key="from_email")
 
     st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>PIPELINE SETTINGS</div>', unsafe_allow_html=True)
-    pipeline_num_files = st.slider("Files to download per run", 1, 30, 5, key="pipeline_num_files",
-                                    help="Each file = ~1 day of new FL registrations (~2,500 businesses)")
-    st.caption(f"≈ {pipeline_num_files * 2500:,} businesses per run")
+
+    # Date range — default to Jan 1 2025 so we only pull recent, high-quality leads
+    from datetime import date as _date
+    default_start = _date(2025, 1, 1)
+    start_date = st.date_input(
+        "Only pull files from",
+        value=default_start,
+        min_value=_date(2022, 11, 1),
+        max_value=_date.today(),
+        key="pipeline_start_date_picker",
+        help="Pull files from this date onward. "
+             "Jan 1 2025 is the sweet spot — these businesses owe a 2026 annual report "
+             "(registered in 2025 or earlier) and are recent enough to likely still be active. "
+             "Do NOT go back to 2026 files — those are new registrations exempt from 2026 reporting."
+    )
+    # Store as YYYYMMDD string for filename comparison
+    start_date_str = start_date.strftime("%Y%m%d")
+    st.session_state["pipeline_start_date"] = start_date_str
+
+    # Estimate how many files are in range
+    days_in_range = (_date.today() - start_date).days
+    est_files     = int(days_in_range * 0.71)   # ~5 files/week
+    est_leads     = est_files * 2500
+    st.caption(f"≈ {est_files:,} files · {est_leads:,} businesses in selected range")
+
+    pipeline_num_files = st.slider("Files per run", 1, 30, 5, key="pipeline_num_files",
+                                    help="How many daily files to download each time you click Run Pipeline")
+    st.caption(f"≈ {pipeline_num_files * 2500:,} new leads per run")
 
     st.markdown('<div class="sh" style="margin-top:0.75rem;"><span class="dot"></span>EMAIL LIMITS</div>', unsafe_allow_html=True)
     daily_limit = st.slider("Daily Send Limit", 10, 500, 100)
@@ -1474,45 +1532,79 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
-# ── Background enrichment status strip ───────────────────────────────────────
+# ── Background enrichment live panel ─────────────────────────────────────────
 bg = bg_status()
-if bg["running"]:
-    checked  = bg["checked"]
+if bg["running"] or bg["checked"] > 0:
+    total    = bg["checked"]
     removed  = bg["removed"]
-    last_act = bg["last_action"]
-    current  = bg["current"]
+    kept     = total - removed
+    emails   = bg["emails_found"]
+    phones   = bg["phones_found"]
+    running  = bg["running"]
+    log_lines = bg.get("log", [])
+    started   = bg.get("started_at", "")
+
+    # ── Stat pills ──
+    status_color = "#4caf7d" if running else "#5a6472"
+    status_label = "● LIVE — CHECKING SUNBIZ" if running else "■ ENRICHMENT COMPLETE"
+    pct_removed  = int(removed / total * 100) if total > 0 else 0
+
     st.markdown(f"""
-    <div style="background:#0d1a12;border:1px solid #2d5a3d;border-left:3px solid #4caf7d;
-                border-radius:4px;padding:.6rem 1rem;margin-bottom:1rem;
-                display:flex;justify-content:space-between;align-items:center;gap:1rem;">
-        <div>
-            <span style="font-size:.7rem;color:#4caf7d;font-weight:700;
-                         text-transform:uppercase;letter-spacing:.1em;font-family:'IBM Plex Mono',monospace;">
-                ● ENRICHMENT RUNNING
-            </span>
-            <span style="font-size:.78rem;color:#a8b4c0;margin-left:.75rem;">
-                {last_act}
-            </span>
+    <div style="background:#0a0f0d;border:1px solid #1e3a2a;border-radius:6px;
+                overflow:hidden;margin-bottom:1.25rem;">
+
+        <!-- Header bar -->
+        <div style="background:#0d1f17;padding:.6rem 1.1rem;
+                    display:flex;justify-content:space-between;align-items:center;
+                    border-bottom:1px solid #1e3a2a;">
+            <div style="display:flex;align-items:center;gap:.6rem;">
+                <span style="font-size:.68rem;font-weight:700;color:{status_color};
+                             text-transform:uppercase;letter-spacing:.12em;
+                             font-family:'IBM Plex Mono',monospace;">
+                    {status_label}
+                </span>
+                {f'<span style="font-size:.68rem;color:#3d5a47;font-family:monospace;">started {started}</span>' if started else ''}
+            </div>
+            <div style="display:flex;gap:1.25rem;">
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
+                    <span style="color:#f0f4f8;font-weight:600;">{total}</span> checked
+                </span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
+                    <span style="color:#e05252;font-weight:600;">{removed}</span> removed ({pct_removed}%)
+                </span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
+                    <span style="color:#4caf7d;font-weight:600;">{kept}</span> active
+                </span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
+                    <span style="color:#5b9cf6;font-weight:600;">{emails}</span> emails ·
+                    <span style="color:#e8a020;font-weight:600;">{phones}</span> phones
+                </span>
+            </div>
         </div>
-        <div style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;white-space:nowrap;">
-            {checked} checked · {removed} removed
+
+        <!-- Progress bar -->
+        <div style="height:2px;background:#1e3a2a;">
+            <div style="height:2px;background:{'#4caf7d' if running else '#2d5a3d'};
+                        width:{min(pct_removed+5,100) if running else 100}%;
+                        transition:width .5s;"></div>
+        </div>
+
+        <!-- Activity log -->
+        <div style="padding:.65rem 1.1rem;font-family:'IBM Plex Mono',monospace;
+                    font-size:.75rem;line-height:1.9;max-height:180px;overflow-y:auto;">
+            {"".join([
+                f'<div style="color:{"#e05252" if "REMOVED" in l else "#4caf7d" if "ACTIVE" in l else "#e8a020" if "Complete" in l or "started" in l else "#a8b4c0"};'
+                f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{l}</div>'
+                for l in reversed(log_lines)
+            ]) if log_lines else
+            '<div style="color:#3d4450;">Waiting for first result…</div>'}
         </div>
     </div>
     """, unsafe_allow_html=True)
-    # Auto-refresh every 3 seconds while background enrichment is running
-    time.sleep(3)
-    st.rerun()
-elif bg["checked"] > 0:
-    # Show summary after enrichment finishes
-    st.markdown(f"""
-    <div style="background:#0d1117;border:1px solid #2a2f38;border-radius:4px;
-                padding:.5rem 1rem;margin-bottom:1rem;">
-        <span style="font-size:.72rem;color:#5a6472;font-family:'IBM Plex Mono',monospace;">
-            ✅ Last enrichment: {bg['checked']} checked · {bg['removed']} inactive removed ·
-            {bg['emails_found']} emails · {bg['phones_found']} phones found
-        </span>
-    </div>
-    """, unsafe_allow_html=True)
+
+    if running:
+        time.sleep(2)
+        st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
