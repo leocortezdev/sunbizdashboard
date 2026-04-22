@@ -19,6 +19,8 @@ from typing import Optional
 import streamlit as st
 import pandas as pd
 import paramiko
+import requests
+from bs4 import BeautifulSoup
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  PAGE CONFIG  (must be first Streamlit call)
@@ -51,56 +53,42 @@ PENALTY_FEE  = 400
 DEADLINE     = "May 1, 2026"
 CURRENT_YEAR = 2026
 
-# ─── Real cordata.zip field layout (verified by probing floridados.gov SFTP) ──
-# Source: /Public/doc/Quarterly/Cor/cordata.zip → internal flat file
-# Offsets confirmed against live sample records (1441 chars/record).
-#
-# DAILY EVENT files (/Public/doc/cor/Events/YYYYMMDDce.txt) are 662-char
-# change-event records — they do NOT contain annual report year.
-# The quarterly cordata.zip is the only source with full entity status + last_rpt_year.
-#
-# cordata.zip field map (start, length):
+# ─── Confirmed field offsets (verified against real 20240919c.txt sample) ────
+# Source: /Public/doc/cor/2021/ daily registration files (YYYYMMDDc.txt)
+# These are NEW ENTITY registrations. Each record is ~1436 chars.
 FW = {
-    "entity_number"  : (0,   12),   # Charter/doc number
-    "entity_name"    : (12,  192),  # Corp name, space-padded to 192
-    "status"         : (204,   1),  # A=Active I=Inactive D=Dissolved V=Voluntary dissolution
-    "state_of_org"   : (205,   2),  # FL etc
-    "entity_type"    : (207,   2),  # AL=LLC CP=Corp etc
-    "reg_addr1"      : (216,  80),  # Registered address line 1
-    "reg_city"       : (296,  30),
-    "reg_zip"        : (326,  10),
-    "mail_addr1"     : (336,  80),
-    "mail_city"      : (416,  30),
-    "mail_state"     : (446,   2),
-    "mail_zip"       : (448,  10),
-    "filed_date"     : (472,   8),  # MMDDYYYY — filing/registration date
-    "state_of_inc"   : (489,   2),
-    # Owner block 1 (primary registered agent / officer)
-    "owner_last"     : (549,  20),
-    "owner_first"    : (569,  15),
-    "owner_mid"      : (584,   7),
-    "owner_title"    : (591,   1),  # P=President R=Reg.Agent M=Manager etc
-    "owner_addr1"    : (592,  40),
-    "owner_city"     : (632,  28),
-    "owner_state"    : (660,   2),
-    "owner_zip"      : (662,   9),
+    "entity_number" : (0,   12),
+    "entity_name"   : (12, 192),   # padded to 192 chars
+    "status"        : (204,  1),   # A=Active
+    "state_of_org"  : (205,  2),   # FL
+    "entity_type"   : (207,  2),   # AL=LLC CP=Corp MN=NonProfit etc
+    "reg_addr1"     : (216, 80),
+    "reg_city"      : (296, 30),
+    "reg_zip"       : (326, 10),
+    "mail_addr1"    : (336, 80),
+    "mail_city"     : (416, 30),
+    "mail_state"    : (446,  2),
+    "mail_zip"      : (448, 10),
+    "filed_date"    : (472,  8),   # MMDDYYYY — registration date
+    "state_of_inc"  : (489,  2),
+    "owner_last"    : (544, 20),   # CONFIRMED offset
+    "owner_first"   : (564, 15),   # CONFIRMED offset
+    "owner_mid"     : (579,  7),   # CONFIRMED offset
+    "owner_title"   : (586,  1),   # P=President/Manager R=Reg.Agent
+    "owner_addr1"   : (587, 40),
+    "owner_city"    : (627, 28),
+    "owner_state"   : (655,  2),
+    "owner_zip"     : (657,  9),
 }
-FW_MIN_LEN = 671   # minimum valid record length
+FW_MIN_LEN = 480
 
-# ── Annual Report Year extraction ─────────────────────────────────────────────
-# cordata.zip records do NOT have a dedicated last_report_year column.
-# The filed_date (MMDDYYYY at offset 472) is the REGISTRATION date.
-# Annual report status is tracked via the Events file (ce.txt).
-# Strategy: any entity registered before 2026 that hasn't appeared in a 2026
-# annual-report event is considered delinquent.  We use the registration year
-# (from filed_date) as a proxy for "last report year" — entities registered
-# in 2025 or earlier owe a 2026 annual report.
+
 def extract_reg_year(record: bytes) -> int:
-    """Extract registration year from filed_date field (MMDDYYYY)."""
+    """Extract registration year from filed_date (MMDDYYYY at offset 472)."""
     try:
         raw = record[472:480].decode("latin-1").strip()
         if len(raw) == 8 and raw.isdigit():
-            return int(raw[4:8])   # last 4 chars = year
+            return int(raw[4:8])
     except Exception:
         pass
     return 0
@@ -132,6 +120,8 @@ def db_init():
                 record_type      TEXT,
                 contact_status   TEXT    DEFAULT 'New',
                 source_file      TEXT,
+                principal_phone  TEXT,
+                enriched_at      TEXT,
                 inserted_at      TEXT    DEFAULT (datetime('now')),
                 last_updated     TEXT    DEFAULT (datetime('now'))
             )
@@ -207,6 +197,33 @@ def db_log_email(entity_number: str, subject: str, body: str, api_resp: str):
         conn.commit()
 
 
+def db_enrich_lead(entity_number: str, email: str, phone: str):
+    """Update a lead with scraped contact info."""
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE leads
+            SET principal_email = CASE WHEN ? != '' THEN ? ELSE principal_email END,
+                principal_phone = CASE WHEN ? != '' THEN ? ELSE principal_phone END,
+                enriched_at = datetime('now'),
+                last_updated = datetime('now')
+            WHERE entity_number = ?
+        """, (email, email, phone, phone, entity_number))
+        conn.commit()
+
+
+def db_get_unenriched(limit: int = 50) -> list:
+    """Return entity numbers that haven't been enriched yet."""
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT entity_number, entity_name FROM leads
+            WHERE (principal_email IS NULL OR principal_email = '')
+            AND (enriched_at IS NULL)
+            ORDER BY inserted_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def db_stats() -> dict:
     with db_connect() as conn:
         total     = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
@@ -214,81 +231,229 @@ def db_stats() -> dict:
         contacted = conn.execute("SELECT COUNT(*) FROM leads WHERE contact_status='Contacted'").fetchone()[0]
         paid      = conn.execute("SELECT COUNT(*) FROM leads WHERE contact_status='Paid'").fetchone()[0]
         emailed   = conn.execute("SELECT COUNT(*) FROM email_log").fetchone()[0]
-    return {"total":total,"new":new_ct,"contacted":contacted,"paid":paid,"emailed":emailed}
+    enriched  = conn.execute("SELECT COUNT(*) FROM leads WHERE enriched_at IS NOT NULL").fetchone()[0]
+    with_email = conn.execute("SELECT COUNT(*) FROM leads WHERE principal_email != '' AND principal_email IS NOT NULL").fetchone()[0]
+    with_phone = conn.execute("SELECT COUNT(*) FROM leads WHERE principal_phone != '' AND principal_phone IS NOT NULL").fetchone()[0]
+    return {"total":total,"new":new_ct,"contacted":contacted,"paid":paid,
+            "emailed":emailed,"enriched":enriched,"with_email":with_email,"with_phone":with_phone}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MODULE 2 — cordata Fixed-Width Parser & Filter
+#  MODULE 2 — Fixed-Width Parser & Filter (confirmed offsets from real data)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _s(record: bytes, start: int, length: int) -> str:
-    """Slice and decode a fixed-width field."""
     return record[start: start + length].decode("latin-1", errors="replace").strip()
 
 
-def parse_cordata_record(record: bytes, source_file: str = "") -> Optional[dict]:
+def parse_record(line: bytes, source_file: str = "") -> Optional[dict]:
     """
-    Parse one record from cordata.zip flat file.
-    Returns a lead dict if the entity is Active and registered before CURRENT_YEAR,
-    otherwise returns None.
+    Parse one record from a Sunbiz daily registration file (YYYYMMDDc.txt).
+    Field offsets confirmed against real file 20240919c.txt.
+    Returns a lead dict only for Active entities registered before CURRENT_YEAR.
     """
-    if len(record) < FW_MIN_LEN:
+    rec = line.rstrip(b"\r\x00")
+    if len(rec) < FW_MIN_LEN:
         return None
 
-    status      = _s(record, 204, 1)
-    entity_name = _s(record, 12, 192)
+    entity_name = _s(rec, 12, 192)
+    status      = _s(rec, 204, 1)
 
-    # Filter: must be Active and have a real name
-    if status != "A" or not entity_name:
+    if not entity_name or status != "A":
         return None
 
-    # Registration year proxy for last_rpt_year
-    reg_year = extract_reg_year(record)
+    reg_year = extract_reg_year(rec)
 
-    # Entities registered in CURRENT_YEAR are brand new — they don\'t owe yet
+    # Entities registered THIS year are brand new — they don't owe a report yet
     if reg_year >= CURRENT_YEAR:
         return None
 
-    # Build owner full name from last + first + mid
-    owner_last  = _s(record, 549, 20)
-    owner_first = _s(record, 569, 15)
-    owner_mid   = _s(record, 584,  7)
+    owner_first = _s(rec, 564, 15)
+    owner_mid   = _s(rec, 579,  7)
+    owner_last  = _s(rec, 544, 20)
     owner_name  = " ".join(p for p in [owner_first, owner_mid, owner_last] if p)
 
-    # Address
-    addr1 = _s(record, 216, 80)
-    city  = _s(record, 296, 30)
-    state = _s(record, 446,  2) or _s(record, 205, 2)
-    zip_  = _s(record, 326, 10)
-    principal_addr = ", ".join(p for p in [addr1, city, state, zip_] if p)
+    reg_addr  = _s(rec, 216, 80)
+    reg_city  = _s(rec, 296, 30)
+    mail_state= _s(rec, 446,  2)
+    reg_zip   = _s(rec, 326, 10)
+    addr      = ", ".join(p for p in [reg_addr, reg_city, mail_state, reg_zip] if p)
 
     return {
-        "record_type"    : _s(record, 207, 2),   # entity type: AL=LLC, CP=Corp, etc.
-        "entity_number"  : _s(record, 0,   12),
+        "record_type"    : _s(rec, 207, 2),   # AL=LLC CP=Corp etc
+        "entity_number"  : _s(rec, 0,   12),
         "status"         : status,
-        "filing_date"    : _s(record, 472,  8),  # MMDDYYYY registration date
+        "filing_date"    : _s(rec, 472,  8),  # MMDDYYYY
         "entity_name"    : entity_name,
-        "last_rpt_year"  : reg_year,             # registration year (proxy)
-        "principal_addr" : principal_addr,
-        "principal_email": "",                   # not in cordata flat file
+        "last_rpt_year"  : reg_year,
+        "principal_addr" : addr,
+        "principal_email": "",                 # not in registration file; enriched separately
         "owner_name"     : owner_name,
-        "owner_title"    : _s(record, 591, 1),
+        "owner_title"    : _s(rec, 586, 1),
         "source_file"    : source_file,
     }
 
 
-def parse_cordata_chunk(data: bytes, source_file: str = "") -> list:
-    """
-    Parse a buffer of cordata records (newline-delimited fixed-width).
-    Each line is one entity record.
-    """
+def parse_file_buffer(data: bytes, source_file: str = "") -> list:
+    """Parse an entire daily registration file buffer."""
     results = []
-    for raw_line in data.split(b"\n"):
-        rec = raw_line.rstrip(b"\r\x00")
-        result = parse_cordata_record(rec, source_file)
-        if result:
-            results.append(result)
+    for line in data.split(b"\n"):
+        r = parse_record(line, source_file)
+        if r:
+            results.append(r)
     return results
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MODULE 1.5 — Sunbiz Web Scraper & Contact Enrichment
+# ═════════════════════════════════════════════════════════════════════════════
+
+SUNBIZ_DETAIL_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResultDetail"
+SUNBIZ_SEARCH_URL = "https://search.sunbiz.org/Inquiry/CorporationSearch/ByName"
+
+_SCRAPE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer": "https://search.sunbiz.org/",
+}
+
+
+def scrape_sunbiz_entity(entity_number: str) -> dict:
+    """
+    Scrape the Sunbiz detail page for a single entity number.
+    Returns dict with keys: email, phone, registered_agent, last_report_year, status.
+    All values default to empty string if not found.
+    """
+    result = {"email": "", "phone": "", "registered_agent": "",
+              "last_report_year": "", "principal_name": ""}
+    try:
+        params = {
+            "inquirytype": "DocumentNumber",
+            "inquiryDirective": "StartsWith",
+            "inquiryValue": entity_number.strip(),
+            "redirected": "true",
+        }
+        resp = requests.get(
+            SUNBIZ_DETAIL_URL, params=params,
+            headers=_SCRAPE_HEADERS, timeout=12
+        )
+        if resp.status_code != 200:
+            return result
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # ── Annual report year ────────────────────────────────────────────
+        # Appears in a span or td next to "Annual Reports" label
+        for label in soup.find_all(["span", "td", "th"]):
+            txt = label.get_text(strip=True).lower()
+            if "annual report" in txt:
+                # Year is usually in the next sibling or table row
+                nxt = label.find_next_sibling()
+                if nxt:
+                    yr_txt = nxt.get_text(strip=True)
+                    import re
+                    yr_match = re.search(r'20\d{2}', yr_txt)
+                    if yr_match:
+                        result["last_report_year"] = yr_match.group()
+                break
+
+        # ── Officers / registered agent section ──────────────────────────
+        # Look for email patterns anywhere on the page
+        import re
+        page_text = soup.get_text(" ")
+        
+        # Email — find anything that looks like an email
+        email_matches = re.findall(
+            r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}',
+            page_text
+        )
+        # Filter out Florida DOS system emails
+        skip_domains = {"sunbiz.org", "dos.myflorida.com", "floridados.gov", "myfloridacfo.com"}
+        for em in email_matches:
+            domain = em.split("@")[-1].lower()
+            if domain not in skip_domains:
+                result["email"] = em.lower()
+                break
+
+        # Phone — look for (XXX) XXX-XXXX or XXX-XXX-XXXX patterns
+        phone_matches = re.findall(
+            r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}',
+            page_text
+        )
+        if phone_matches:
+            result["phone"] = phone_matches[0].strip()
+
+        # Registered agent name
+        for label in soup.find_all(string=re.compile("Registered Agent", re.I)):
+            parent = label.parent
+            if parent:
+                # Name is usually in the next row/span
+                nxt = parent.find_next("span", class_=re.compile("value|data", re.I))
+                if not nxt:
+                    nxt = parent.find_next_sibling()
+                if nxt:
+                    result["registered_agent"] = nxt.get_text(strip=True)[:80]
+            break
+
+    except requests.exceptions.Timeout:
+        pass
+    except Exception:
+        pass
+
+    return result
+
+
+def run_enrichment_sync(batch_size: int = 50, delay_sec: float = 1.5):
+    """
+    Scrape Sunbiz detail pages for leads missing contact info.
+    Runs synchronously inside st.status() — call directly from button.
+    Rate-limited to be polite to the state server.
+    """
+    leads = db_get_unenriched(limit=batch_size)
+
+    with st.status(f"Enriching {len(leads)} leads from Sunbiz…", expanded=True) as status:
+        def w(msg):
+            ts = datetime.now().strftime("%H:%M:%S")
+            status.write(f"[{ts}] {msg}")
+
+        if not leads:
+            w("✅ All leads already enriched — nothing to do.")
+            status.update(label="Already up to date", state="complete", expanded=False)
+            return
+
+        found_email = found_phone = 0
+
+        for i, lead in enumerate(leads):
+            entity_num  = lead["entity_number"]
+            entity_name = lead["entity_name"]
+
+            w(f"🔍 [{i+1}/{len(leads)}] {entity_name} ({entity_num})")
+            data = scrape_sunbiz_entity(entity_num)
+
+            if data["email"]:
+                found_email += 1
+                w(f"  ✉  {data['email']}")
+            if data["phone"]:
+                found_phone += 1
+                w(f"  📞 {data['phone']}")
+            if not data["email"] and not data["phone"]:
+                w(f"  ─  No contact info on file")
+
+            db_enrich_lead(entity_num, data["email"], data["phone"])
+
+            # Polite delay — don't hammer the state server
+            if i < len(leads) - 1:
+                time.sleep(delay_sec)
+
+        w(f"")
+        w(f"✅ Enrichment complete — {found_email} emails, {found_phone} phones found")
+        w(f"   Hit rate: {(found_email/len(leads)*100):.0f}% email  |  {(found_phone/len(leads)*100):.0f}% phone")
+        status.update(
+            label=f"✅ Enriched {len(leads)} leads — {found_email} emails, {found_phone} phones",
+            state="complete", expanded=False
+        )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -356,47 +521,37 @@ def run_pipeline_sync():
             sftp = paramiko.SFTPClient.from_transport(transport)
             w("✅ SFTP connection established.")
 
-            # ── Stream cordata.zip in chunks (1.7 GB) ─────────────────────
-            zip_stat  = sftp.stat(QUARTERLY_COR)
-            zip_bytes = zip_stat.st_size
-            w(f"📦 cordata.zip → {zip_bytes/1024/1024:.1f} MB — streaming …")
-            w("⏳ This takes several minutes on a typical connection.")
-
-            buf = io.BytesIO()
-            downloaded = 0
-            last_pct   = -1
-            with sftp.open(QUARTERLY_COR, "rb") as remote_f:
-                remote_f.prefetch()
-                while True:
-                    chunk = remote_f.read(ZIP_CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    buf.write(chunk)
-                    downloaded += len(chunk)
-                    pct = int(downloaded / zip_bytes * 100)
-                    if pct != last_pct and pct % 5 == 0:
-                        w(f"  ↓ {downloaded/1024/1024:.1f} / {zip_bytes/1024/1024:.1f} MB ({pct}%)")
-                        last_pct = pct
+            # ── Find the most recent daily registration files ──────────────
+            # Files live in /Public/doc/cor/YYYY/ named YYYYMMDDc.txt
+            # We look for the most recent available year folder then newest file
+            all_records_raw = []
+            for year in ["2021"]:   # expand to 2022+ if Florida adds more years
+                remote_dir = f"/Public/doc/cor/{year}/"
+                try:
+                    attrs = sftp.listdir_attr(remote_dir)
+                    attrs = [a for a in attrs if a.filename.endswith("c.txt")]
+                    if not attrs:
+                        continue
+                    attrs.sort(key=lambda a: a.filename, reverse=True)
+                    # Download the 3 most recent files to get a solid lead batch
+                    for attr in attrs[:3]:
+                        fname = attr.filename
+                        fpath = remote_dir + fname
+                        w(f"⬇  Downloading {fname} ({attr.st_size/1024:.0f} KB) …")
+                        buf = io.BytesIO()
+                        sftp.getfo(fpath, buf)
+                        buf.seek(0)
+                        raw = buf.read()
+                        recs = parse_file_buffer(raw, source_file=fname)
+                        w(f"  → {len(recs):,} leads from {fname}")
+                        all_records_raw.extend(recs)
+                except Exception as e:
+                    w(f"⚠  Could not read {remote_dir}: {e}")
 
             sftp.close()
             transport.close()
             w("🔌 SFTP connection closed.")
-
-            # ── Unzip and parse ────────────────────────────────────────────
-            import zipfile
-            buf.seek(0)
-            w("📂 Opening cordata.zip …")
-            with zipfile.ZipFile(buf) as zf:
-                names = zf.namelist()
-                w(f"  Contents: {names}")
-                for inner_name in names:
-                    ext = inner_name.upper()
-                    if any(ext.endswith(x) for x in (".TXT",".DAT",".CSV")) or "." not in inner_name:
-                        w(f"🔍 Parsing {inner_name} …")
-                        inner_data = zf.read(inner_name)
-                        recs = parse_cordata_chunk(inner_data, source_file=inner_name)
-                        w(f"  → {len(recs):,} delinquent Active entities found")
-                        all_records.extend(recs)
+            all_records = all_records_raw
 
         except paramiko.AuthenticationException:
             w("❌ Authentication failed — check SFTP credentials in sidebar.")
@@ -641,6 +796,11 @@ with st.sidebar:
     daily_limit = st.slider("Daily Send Limit", 10, 500, 100)
     delay_sec   = st.slider("Delay Between Sends (s)", 0, 10, 2)
 
+    st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>ENRICHMENT</div>', unsafe_allow_html=True)
+    enrich_batch  = st.slider("Batch size (leads per run)", 10, 200, 50)
+    enrich_delay  = st.slider("Delay between requests (s)", 0.5, 5.0, 1.5, step=0.5)
+    st.caption("Scrapes Sunbiz detail pages for emails & phones.")
+
     st.markdown("---")
     if st.session_state.last_pipeline_run:
         st.caption(f"Last run: {st.session_state.last_pipeline_run}")
@@ -668,9 +828,19 @@ with hc2:
         use_container_width=True,
         help="SFTP download → parse fixed-width → filter delinquents → SQLite upsert",
     )
+    enrich_btn = st.button(
+        "🔍  Enrich Contacts",
+        type="secondary",
+        use_container_width=True,
+        help="Scrape Sunbiz pages for emails & phone numbers",
+    )
 
 if run_btn:
     run_pipeline_sync()
+    st.rerun()
+
+if enrich_btn:
+    run_enrichment_sync(batch_size=enrich_batch, delay_sec=enrich_delay)
     st.rerun()
 
 if st.session_state.pipeline_complete and st.session_state.pipeline_logs:
@@ -698,7 +868,7 @@ st.markdown(f"""
   <div class="kpi-cell">
     <div class="kpi-lbl">Outreach Sent</div>
     <div class="kpi-val">{stats['emailed']:,}</div>
-    <div class="kpi-sub">{stats['contacted']:,} contacted · {stats['paid']:,} paid</div>
+    <div class="kpi-sub">{stats['contacted']:,} contacted · {stats['paid']:,} paid · {stats.get('enriched',0):,} enriched</div>
   </div>
   <div class="kpi-cell">
     <div class="kpi-lbl">Hard Deadline</div>
@@ -749,13 +919,14 @@ with tab_leads:
         st.caption(f"{len(df):,} records  ·  Potential penalties: **${len(df)*PENALTY_FEE:,}**")
 
         COLS = ["entity_number","entity_name","owner_name",
-                "principal_email","last_rpt_year","contact_status","inserted_at"]
+                "principal_email","principal_phone","last_rpt_year","contact_status","inserted_at"]
         cfg  = {
             "entity_number"  : st.column_config.TextColumn("Entity #",   width="small"),
             "entity_name"    : st.column_config.TextColumn("Entity",     width="large"),
             "owner_name"     : st.column_config.TextColumn("Owner",      width="medium"),
             "principal_email": st.column_config.TextColumn("Email",      width="medium"),
-            "last_rpt_year"  : st.column_config.NumberColumn("Last Rpt", width="small", format="%d"),
+            "principal_phone": st.column_config.TextColumn("Phone",      width="small"),
+            "last_rpt_year"  : st.column_config.NumberColumn("Reg Year", width="small", format="%d"),
             "contact_status" : st.column_config.SelectboxColumn("Status",
                                    options=["New","Contacted","Paid"], width="small"),
             "inserted_at"    : st.column_config.TextColumn("Added",      width="medium"),
@@ -808,16 +979,18 @@ with tab_email:
             sc     = sc_map.get(sel.get("contact_status","New"), "bn")
             yrs_del = max(CURRENT_YEAR - int(sel.get("last_rpt_year") or CURRENT_YEAR-1), 1)
 
+            enriched = "✅ enriched" if sel.get("enriched_at") else "⏳ not yet enriched"
             st.markdown(f"""
             <div class="lcard">
               <div class="lcard-name">{sel.get('entity_name','—')}</div>
               <div class="lcard-det">
 Owner   {sel.get('owner_name','—') or '—'}
-Email   {sel.get('principal_email','—') or '—'}
+Email   {sel.get('principal_email','—') or '─ (run Enrich Contacts)'}
+Phone   {sel.get('principal_phone','—') or '─ (run Enrich Contacts)'}
 Entity  {sel.get('entity_number','—')}
 Addr    {sel.get('principal_addr','—') or '—'}
 Rpt Yr  {sel.get('last_rpt_year','—')}
-Source  {sel.get('source_file','—') or '—'}</div>
+Enrich  {enriched}</div>
             </div>
             <span class="badge {sc}">{sel.get('contact_status','New')}</span>
             <div class="pbox" style="margin-top:.8rem;">
