@@ -109,6 +109,12 @@ def db_migrate():
     migrations = [
         "ALTER TABLE leads ADD COLUMN principal_phone TEXT",
         "ALTER TABLE leads ADD COLUMN enriched_at TEXT",
+        "ALTER TABLE leads ADD COLUMN website TEXT",
+        "ALTER TABLE leads ADD COLUMN linkedin_url TEXT",
+        "ALTER TABLE leads ADD COLUMN instagram_url TEXT",
+        "ALTER TABLE leads ADD COLUMN facebook_url TEXT",
+        "ALTER TABLE leads ADD COLUMN google_search_done INTEGER DEFAULT 0",
+        "ALTER TABLE leads ADD COLUMN is_active_business INTEGER DEFAULT 0",
     ]
     with db_connect() as conn:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(leads)")}
@@ -140,6 +146,12 @@ def db_init():
                 source_file      TEXT,
                 principal_phone  TEXT,
                 enriched_at      TEXT,
+                website          TEXT,
+                linkedin_url     TEXT,
+                instagram_url    TEXT,
+                facebook_url     TEXT,
+                google_search_done INTEGER DEFAULT 0,
+                is_active_business INTEGER DEFAULT 0,
                 inserted_at      TEXT    DEFAULT (datetime('now')),
                 last_updated     TEXT    DEFAULT (datetime('now'))
             )
@@ -155,6 +167,13 @@ def db_init():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_cs ON leads(contact_status)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS downloaded_files (
+                filename      TEXT PRIMARY KEY,
+                downloaded_at TEXT DEFAULT (datetime('now')),
+                records_found INTEGER DEFAULT 0
+            )
+        """)
         conn.commit()
     db_migrate()  # safe every startup — skips already-existing columns
 
@@ -230,6 +249,48 @@ def db_enrich_lead(entity_number: str, email: str, phone: str):
         conn.commit()
 
 
+def db_save_google_results(entity_number: str, results: dict):
+    """Save Google search enrichment results to a lead."""
+    with db_connect() as conn:
+        conn.execute("""
+            UPDATE leads SET
+                website            = CASE WHEN ? != '' THEN ? ELSE website END,
+                linkedin_url       = CASE WHEN ? != '' THEN ? ELSE linkedin_url END,
+                instagram_url      = CASE WHEN ? != '' THEN ? ELSE instagram_url END,
+                facebook_url       = CASE WHEN ? != '' THEN ? ELSE facebook_url END,
+                principal_email    = CASE WHEN ? != '' THEN ? ELSE principal_email END,
+                principal_phone    = CASE WHEN ? != '' THEN ? ELSE principal_phone END,
+                is_active_business = ?,
+                google_search_done = 1,
+                enriched_at        = datetime('now'),
+                last_updated       = datetime('now')
+            WHERE entity_number = ?
+        """, (
+            results.get("website",""),    results.get("website",""),
+            results.get("linkedin",""),   results.get("linkedin",""),
+            results.get("instagram",""),  results.get("instagram",""),
+            results.get("facebook",""),   results.get("facebook",""),
+            results.get("email",""),      results.get("email",""),
+            results.get("phone",""),      results.get("phone",""),
+            1 if results.get("is_active") else 0,
+            entity_number,
+        ))
+        conn.commit()
+
+
+def db_get_ungoogled(limit: int = 50) -> list:
+    """Return leads that haven't had a Google search run yet."""
+    with db_connect() as conn:
+        rows = conn.execute("""
+            SELECT entity_number, entity_name, owner_name, principal_addr
+            FROM leads
+            WHERE google_search_done = 0 OR google_search_done IS NULL
+            ORDER BY inserted_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def db_get_unenriched(limit: int = 50) -> list:
     """Return entity numbers that haven't been enriched yet."""
     with db_connect() as conn:
@@ -255,6 +316,45 @@ def db_stats() -> dict:
     with_phone = conn.execute("SELECT COUNT(*) FROM leads WHERE principal_phone != '' AND principal_phone IS NOT NULL").fetchone()[0]
     return {"total":total,"new":new_ct,"contacted":contacted,"paid":paid,
             "emailed":emailed,"enriched":enriched,"with_email":with_email,"with_phone":with_phone}
+
+
+def db_get_downloaded_files() -> set:
+    """Return set of filenames already downloaded."""
+    with db_connect() as conn:
+        rows = conn.execute("SELECT filename FROM downloaded_files").fetchall()
+    return {r[0] for r in rows}
+
+
+def db_mark_file_downloaded(filename: str, records_found: int):
+    """Record that a file has been downloaded and parsed."""
+    with db_connect() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO downloaded_files (filename, records_found)
+            VALUES (?, ?)
+        """, (filename, records_found))
+        conn.commit()
+
+
+def db_get_cursor_stats() -> dict:
+    """Return stats about pipeline progress."""
+    with db_connect() as conn:
+        total_files = conn.execute("SELECT COUNT(*) FROM downloaded_files").fetchone()[0]
+        oldest      = conn.execute("SELECT MIN(filename) FROM downloaded_files").fetchone()[0]
+        newest      = conn.execute("SELECT MAX(filename) FROM downloaded_files").fetchone()[0]
+        total_recs  = conn.execute("SELECT SUM(records_found) FROM downloaded_files").fetchone()[0]
+    return {
+        "files_downloaded": total_files,
+        "oldest_file": oldest or "—",
+        "newest_file": newest or "—",
+        "total_parsed": total_recs or 0,
+    }
+
+
+def db_reset_cursor():
+    """Clear the downloaded files cursor — forces full re-download on next run."""
+    with db_connect() as conn:
+        conn.execute("DELETE FROM downloaded_files")
+        conn.commit()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -476,6 +576,212 @@ def run_enrichment_sync(batch_size: int = 50, delay_sec: float = 1.5):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  MODULE 1.6 — Google Search Enrichment (Social + Website + Contact)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def google_search_lead(entity_name: str, owner_name: str, city: str,
+                       serp_api_key: str = "") -> dict:
+    """
+    Search Google for a business/owner and extract:
+      - Website URL
+      - LinkedIn profile
+      - Instagram profile
+      - Facebook page
+      - Email found on website
+      - Phone found on website
+      - Whether the business appears actively operating
+
+    Uses SerpAPI if an API key is provided (most reliable).
+    Falls back to scraping DuckDuckGo HTML (free, no key needed, rate-limited).
+    """
+    import re
+
+    result = {
+        "website": "", "linkedin": "", "instagram": "",
+        "facebook": "", "email": "", "phone": "",
+        "is_active": False, "search_snippet": "",
+    }
+
+    # Build search query — specific enough to find the right business
+    city_clean = city.split(",")[0].strip() if city else "Florida"
+    query = f'"{entity_name}" {owner_name} Florida'
+
+    # ── Option A: SerpAPI (paid, reliable, $50/mo for 5k searches) ────────
+    if serp_api_key:
+        try:
+            resp = requests.get("https://serpapi.com/search", params={
+                "q": query, "api_key": serp_api_key,
+                "num": 10, "gl": "us", "hl": "en",
+            }, timeout=10)
+            data = resp.json()
+            organic = data.get("organic_results", [])
+
+            for r in organic:
+                url   = r.get("link", "").lower()
+                title = r.get("title", "").lower()
+                snip  = r.get("snippet", "")
+
+                # Tag social profiles
+                if "linkedin.com/in/" in url or "linkedin.com/company/" in url:
+                    if not result["linkedin"]:
+                        result["linkedin"] = r["link"]
+                elif "instagram.com/" in url and not url.endswith("instagram.com/"):
+                    if not result["instagram"]:
+                        result["instagram"] = r["link"]
+                elif "facebook.com/" in url and not url.endswith("facebook.com/"):
+                    if not result["facebook"]:
+                        result["facebook"] = r["link"]
+                elif not result["website"] and not any(s in url for s in [
+                    "sunbiz", "floridados", "linkedin", "instagram",
+                    "facebook", "twitter", "yelp", "bbb.org", "yellowpages"
+                ]):
+                    result["website"] = r["link"]
+
+                result["search_snippet"] += snip + " "
+
+            result["is_active"] = bool(result["website"] or result["linkedin"]
+                                        or result["instagram"] or result["facebook"])
+            return result
+
+        except Exception:
+            pass  # fall through to DuckDuckGo
+
+    # ── Option B: DuckDuckGo HTML scrape (free, ~1 req/2s to avoid blocks) ─
+    try:
+        ddg_url = "https://html.duckduckgo.com/html/"
+        resp = requests.post(
+            ddg_url,
+            data={"q": query, "b": "", "kl": "us-en"},
+            headers={**_SCRAPE_HEADERS, "Content-Type": "application/x-www-form-urlencoded"},
+            timeout=12,
+        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        links = soup.select("a.result__url, a.result__a")
+
+        for tag in links:
+            href = tag.get("href", "")
+            # DuckDuckGo wraps URLs — extract the real URL
+            if "uddg=" in href:
+                from urllib.parse import unquote, urlparse, parse_qs
+                qs = parse_qs(urlparse(href).query)
+                href = unquote(qs.get("uddg", [""])[0])
+
+            url = href.lower()
+            if not url.startswith("http"):
+                continue
+
+            if "linkedin.com/in/" in url or "linkedin.com/company/" in url:
+                if not result["linkedin"]: result["linkedin"] = href
+            elif "instagram.com/" in url and len(url.split("instagram.com/")[-1]) > 1:
+                if not result["instagram"]: result["instagram"] = href
+            elif "facebook.com/" in url and len(url.split("facebook.com/")[-1]) > 1:
+                if not result["facebook"]: result["facebook"] = href
+            elif not result["website"] and not any(s in url for s in [
+                "sunbiz", "floridados", "linkedin", "instagram", "facebook",
+                "twitter", "x.com", "yelp", "bbb.org", "yellowpages", "mapquest",
+                "whitepages", "spokeo", "radaris", "bizapedia", "opencorporates"
+            ]):
+                result["website"] = href
+
+        # ── Scrape the website for email + phone ──────────────────────────
+        if result["website"]:
+            try:
+                wr = requests.get(result["website"], headers=_SCRAPE_HEADERS,
+                                  timeout=8, allow_redirects=True)
+                page_text = BeautifulSoup(wr.text, "html.parser").get_text(" ")
+
+                # Email
+                emails = re.findall(
+                    r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', page_text
+                )
+                skip_domains = {"example.com", "yourdomain.com", "gmail.com" , "wixpress.com",
+                                 "squarespace.com", "wordpress.com", "sentry.io"}
+                for em in emails:
+                    if em.split("@")[-1].lower() not in skip_domains:
+                        result["email"] = em.lower()
+                        break
+
+                # Phone
+                phones = re.findall(
+                    r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}', page_text
+                )
+                if phones:
+                    result["phone"] = phones[0].strip()
+
+            except Exception:
+                pass
+
+        result["is_active"] = bool(
+            result["website"] or result["linkedin"]
+            or result["instagram"] or result["facebook"]
+        )
+
+    except Exception:
+        pass
+
+    return result
+
+
+def run_google_enrichment_sync(batch_size: int = 25, delay_sec: float = 2.0,
+                                serp_api_key: str = ""):
+    """
+    Run Google search enrichment for leads that haven't been searched yet.
+    Synchronous — call directly from button handler.
+    """
+    leads = db_get_ungoogled(limit=batch_size)
+
+    with st.status(f"Google enrichment: {len(leads)} leads…", expanded=True) as status:
+        def w(msg):
+            ts = datetime.now().strftime("%H:%M:%S")
+            status.write(f"[{ts}] {msg}")
+
+        if not leads:
+            w("✅ All leads already searched.")
+            status.update(label="Nothing to search", state="complete", expanded=False)
+            return
+
+        found_web = found_li = found_ig = found_fb = found_email = found_phone = 0
+
+        for i, lead in enumerate(leads):
+            name    = lead["entity_name"]
+            owner   = lead.get("owner_name", "")
+            city    = lead.get("principal_addr", "")
+            num     = lead["entity_number"]
+
+            w(f"🔍 [{i+1}/{len(leads)}] {name}")
+
+            data = google_search_lead(name, owner, city, serp_api_key)
+            db_save_google_results(num, data)
+
+            parts = []
+            if data["website"]:   found_web   += 1; parts.append(f"🌐 {data['website'][:50]}")
+            if data["linkedin"]:  found_li    += 1; parts.append(f"💼 LinkedIn")
+            if data["instagram"]: found_ig    += 1; parts.append(f"📸 Instagram")
+            if data["facebook"]:  found_fb    += 1; parts.append(f"👍 Facebook")
+            if data["email"]:     found_email += 1; parts.append(f"✉ {data['email']}")
+            if data["phone"]:     found_phone += 1; parts.append(f"📞 {data['phone']}")
+
+            if parts:
+                w(f"  → {' | '.join(parts)}")
+            else:
+                w(f"  → No web presence found (likely dormant)")
+
+            if i < len(leads) - 1:
+                time.sleep(delay_sec)
+
+        w("")
+        w(f"✅ Done — {len(leads)} searched")
+        w(f"   🌐 Websites:  {found_web}  |  💼 LinkedIn: {found_li}")
+        w(f"   📸 Instagram: {found_ig}  |  👍 Facebook: {found_fb}")
+        w(f"   ✉  Emails:   {found_email}  |  📞 Phones: {found_phone}")
+        w(f"   🏢 Active businesses confirmed: {found_web+found_li+found_ig+found_fb}")
+        status.update(
+            label=f"✅ {len(leads)} searched — {found_web} websites, {found_li} LinkedIn, {found_ig} Instagram",
+            state="complete", expanded=False,
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  MODULE 1 — SFTP Pipeline (runs synchronously in main thread via st.status)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -540,45 +846,68 @@ def run_pipeline_sync():
             sftp = paramiko.SFTPClient.from_transport(transport)
             w("✅ SFTP connection established.")
 
-            # ── Find the most recent daily registration files ──────────────
-            # Files live in /Public/doc/cor/YYYY/ named YYYYMMDDc.txt
-            # We look for the most recent available year folder then newest file
             # ── All daily files live flat in /Public/doc/cor/ ─────────────
             remote_dir = "/Public/doc/cor/"
             attrs = sftp.listdir_attr(remote_dir)
 
-            # Keep only YYYYMMDDc.txt files, sort newest first
+            # Keep only YYYYMMDDc.txt files, sort OLDEST first so we
+            # process chronologically and the cursor always moves forward
             daily = sorted(
                 [a for a in attrs if a.filename.endswith("c.txt") and a.filename[:4].isdigit()],
                 key=lambda a: a.filename,
-                reverse=True,
             )
 
-            w(f"📂 Found {len(daily):,} daily files in {remote_dir}")
-            w(f"   Newest: {daily[0].filename}  |  Oldest available: {daily[-1].filename}")
+            w(f"📂 Found {len(daily):,} daily files on server")
+            w(f"   Range: {daily[0].filename} → {daily[-1].filename}")
 
-            # How many files to download — configurable via sidebar
-            num_files = st.session_state.get("pipeline_num_files", 5)
-            target = daily[:num_files]
-            w(f"⬇  Downloading {len(target)} most recent files …")
+            # ── Cursor: skip files already downloaded ─────────────────────
+            already_done = db_get_downloaded_files()
+            new_files    = [a for a in daily if a.filename not in already_done]
 
-            all_records_raw = []
-            for attr in target:
-                fname = attr.filename
-                fpath = remote_dir + fname
-                w(f"   {fname}  ({attr.st_size/1024:.0f} KB)")
-                buf = io.BytesIO()
-                sftp.getfo(fpath, buf)
-                buf.seek(0)
-                recs = parse_file_buffer(buf.read(), source_file=fname)
-                w(f"   → {len(recs):,} records parsed")
-                all_records_raw.extend(recs)
+            w(f"   Already downloaded: {len(already_done):,} files")
+            w(f"   New files to fetch: {len(new_files):,} files")
 
-            sftp.close()
-            transport.close()
-            w("🔌 SFTP connection closed.")
-            w(f"✅ Total raw records: {len(all_records_raw):,}")
-            all_records = all_records_raw
+            if not new_files:
+                w("✅ Already up to date — no new files on server.")
+                sftp.close()
+                transport.close()
+                w("🔌 SFTP connection closed.")
+                all_records = []
+            else:
+                # Batch size from sidebar — how many new files per run
+                num_files = st.session_state.get("pipeline_num_files", 5)
+                target    = new_files[:num_files]   # oldest-first batch of N new files
+
+                if len(new_files) > num_files:
+                    w(f"⏭  Processing {num_files} of {len(new_files)} new files this run")
+                    w(f"   ({len(new_files) - num_files} more will be picked up on next run)")
+                else:
+                    w(f"⬇  Downloading all {len(target)} new files …")
+
+                all_records_raw = []
+                for attr in target:
+                    fname = attr.filename
+                    fpath = remote_dir + fname
+                    w(f"   📄 {fname}  ({attr.st_size/1024:.0f} KB)")
+                    buf = io.BytesIO()
+                    sftp.getfo(fpath, buf)
+                    buf.seek(0)
+                    recs = parse_file_buffer(buf.read(), source_file=fname)
+                    db_mark_file_downloaded(fname, len(recs))
+                    w(f"      → {len(recs):,} records  ✓ cursor saved")
+                    all_records_raw.extend(recs)
+
+                sftp.close()
+                transport.close()
+                w("🔌 SFTP connection closed.")
+
+                cursor = db_get_cursor_stats()
+                w(f"")
+                w(f"📊 Cursor progress: {cursor['files_downloaded']:,} / {len(daily):,} total files")
+                w(f"   Total records ever parsed: {cursor['total_parsed']:,}")
+                w(f"   Files remaining on server: {len(daily) - cursor['files_downloaded']:,}")
+                w(f"✅ Total new records this run: {len(all_records_raw):,}")
+                all_records = all_records_raw
 
         except paramiko.AuthenticationException:
             w("❌ Authentication failed — check SFTP credentials in sidebar.")
@@ -829,13 +1158,38 @@ with st.sidebar:
     delay_sec   = st.slider("Delay Between Sends (s)", 0, 10, 2)
 
     st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>ENRICHMENT</div>', unsafe_allow_html=True)
-    enrich_batch  = st.slider("Batch size (leads per run)", 10, 200, 50)
-    enrich_delay  = st.slider("Delay between requests (s)", 0.5, 5.0, 1.5, step=0.5)
+    enrich_batch  = st.slider("Sunbiz batch size", 10, 200, 50)
+    enrich_delay  = st.slider("Sunbiz delay (s)", 0.5, 5.0, 1.5, step=0.5)
     st.caption("Scrapes Sunbiz detail pages for emails & phones.")
+
+    st.markdown('<div class="sh" style="margin-top:0.75rem;"><span class="dot"></span>GOOGLE ENRICHMENT</div>', unsafe_allow_html=True)
+    serp_api_key  = st.text_input("SerpAPI Key (optional)", type="password",
+                                   placeholder="leave blank = free DuckDuckGo",
+                                   key="serp_api_key",
+                                   help="Get a key at serpapi.com — $50/mo for 5k searches. Leave blank to use free DuckDuckGo scraping.")
+    google_batch  = st.slider("Google batch size", 5, 100, 25)
+    google_delay  = st.slider("Google delay (s)", 1.0, 6.0, 2.0, step=0.5)
+    st.caption("Finds website, LinkedIn, Instagram, Facebook, email & phone.")
 
     st.markdown("---")
     if st.session_state.last_pipeline_run:
         st.caption(f"Last run: {st.session_state.last_pipeline_run}")
+
+    # Cursor progress
+    try:
+        cur = db_get_cursor_stats()
+        if cur["files_downloaded"] > 0:
+            st.markdown('<div class="sh"><span class="dot"></span>PIPELINE CURSOR</div>', unsafe_allow_html=True)
+            st.caption(f"📁 {cur['files_downloaded']:,} files downloaded")
+            st.caption(f"📄 {cur['total_parsed']:,} total records parsed")
+            st.caption(f"📅 Last file: {cur['newest_file']}")
+            if st.button("🔄 Reset Cursor", use_container_width=True,
+                         help="Forces a full re-download of all files on next run"):
+                db_reset_cursor()
+                st.success("Cursor reset — next run will start from the beginning.")
+                st.rerun()
+    except Exception:
+        pass
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -866,6 +1220,12 @@ with hc2:
         use_container_width=True,
         help="Scrape Sunbiz pages for emails & phone numbers",
     )
+    google_btn = st.button(
+        "🌐  Google Search",
+        type="secondary",
+        use_container_width=True,
+        help="Find websites, LinkedIn, Instagram, Facebook for each lead",
+    )
 
 if run_btn:
     run_pipeline_sync()
@@ -873,6 +1233,14 @@ if run_btn:
 
 if enrich_btn:
     run_enrichment_sync(batch_size=enrich_batch, delay_sec=enrich_delay)
+    st.rerun()
+
+if google_btn:
+    run_google_enrichment_sync(
+        batch_size=google_batch,
+        delay_sec=google_delay,
+        serp_api_key=serp_api_key,
+    )
     st.rerun()
 
 if st.session_state.pipeline_complete and st.session_state.pipeline_logs:
@@ -950,18 +1318,23 @@ with tab_leads:
 
         st.caption(f"{len(df):,} records  ·  Potential penalties: **${len(df)*PENALTY_FEE:,}**")
 
-        COLS = ["entity_number","entity_name","owner_name",
-                "principal_email","principal_phone","last_rpt_year","contact_status","inserted_at"]
+        COLS = ["entity_number","entity_name","owner_name","principal_email",
+                "principal_phone","website","linkedin_url","instagram_url",
+                "facebook_url","last_rpt_year","contact_status","inserted_at"]
         cfg  = {
-            "entity_number"  : st.column_config.TextColumn("Entity #",   width="small"),
-            "entity_name"    : st.column_config.TextColumn("Entity",     width="large"),
-            "owner_name"     : st.column_config.TextColumn("Owner",      width="medium"),
-            "principal_email": st.column_config.TextColumn("Email",      width="medium"),
-            "principal_phone": st.column_config.TextColumn("Phone",      width="small"),
-            "last_rpt_year"  : st.column_config.NumberColumn("Reg Year", width="small", format="%d"),
+            "entity_number"  : st.column_config.TextColumn("Entity #",    width="small"),
+            "entity_name"    : st.column_config.TextColumn("Entity",      width="large"),
+            "owner_name"     : st.column_config.TextColumn("Owner",       width="medium"),
+            "principal_email": st.column_config.TextColumn("Email",       width="medium"),
+            "principal_phone": st.column_config.TextColumn("Phone",       width="small"),
+            "website"        : st.column_config.LinkColumn("Website",     width="medium", display_text="🌐 Open"),
+            "linkedin_url"   : st.column_config.LinkColumn("LinkedIn",    width="small",  display_text="💼"),
+            "instagram_url"  : st.column_config.LinkColumn("Instagram",   width="small",  display_text="📸"),
+            "facebook_url"   : st.column_config.LinkColumn("Facebook",    width="small",  display_text="👍"),
+            "last_rpt_year"  : st.column_config.NumberColumn("Reg Year",  width="small",  format="%d"),
             "contact_status" : st.column_config.SelectboxColumn("Status",
                                    options=["New","Contacted","Paid"], width="small"),
-            "inserted_at"    : st.column_config.TextColumn("Added",      width="medium"),
+            "inserted_at"    : st.column_config.TextColumn("Added",       width="medium"),
         }
 
         edited = st.data_editor(df[COLS], use_container_width=True, hide_index=True,
@@ -1016,15 +1389,24 @@ with tab_email:
             <div class="lcard">
               <div class="lcard-name">{sel.get('entity_name','—')}</div>
               <div class="lcard-det">
-Owner   {sel.get('owner_name','—') or '—'}
-Email   {sel.get('principal_email','—') or '─ (run Enrich Contacts)'}
-Phone   {sel.get('principal_phone','—') or '─ (run Enrich Contacts)'}
-Entity  {sel.get('entity_number','—')}
-Addr    {sel.get('principal_addr','—') or '—'}
-Rpt Yr  {sel.get('last_rpt_year','—')}
-Enrich  {enriched}</div>
+Owner     {sel.get('owner_name','—') or '—'}
+Email     {sel.get('principal_email','—') or '─ run Enrich'}
+Phone     {sel.get('principal_phone','—') or '─ run Enrich'}
+Website   {sel.get('website','—') or '─ run Google Search'}
+LinkedIn  {sel.get('linkedin_url','—') or '─'}
+Instagram {sel.get('instagram_url','—') or '─'}
+Facebook  {sel.get('facebook_url','—') or '─'}
+Entity    {sel.get('entity_number','—')}
+Addr      {sel.get('principal_addr','—') or '—'}
+Enrich    {enriched}</div>
             </div>
             <span class="badge {sc}">{sel.get('contact_status','New')}</span>
+            <div style="margin-top:0.75rem; display:flex; gap:0.5rem; flex-wrap:wrap;">
+                {f'<a href="{sel["website"]}" target="_blank" style="text-decoration:none;"><span class="badge bn">🌐 Website</span></a>' if sel.get("website") else ""}
+                {f'<a href="{sel["linkedin_url"]}" target="_blank" style="text-decoration:none;"><span class="badge bc">💼 LinkedIn</span></a>' if sel.get("linkedin_url") else ""}
+                {f'<a href="{sel["instagram_url"]}" target="_blank" style="text-decoration:none;"><span class="badge bn">📸 Instagram</span></a>' if sel.get("instagram_url") else ""}
+                {f'<a href="{sel["facebook_url"]}" target="_blank" style="text-decoration:none;"><span class="badge bp">👍 Facebook</span></a>' if sel.get("facebook_url") else ""}
+            </div>
             <div class="pbox" style="margin-top:.8rem;">
               <div class="plbl">Estimated Penalty Exposure</div>
               <div class="pnum">${PENALTY_FEE * yrs_del:,}</div>
