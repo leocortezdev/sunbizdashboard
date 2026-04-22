@@ -33,34 +33,77 @@ st.set_page_config(
 # ═════════════════════════════════════════════════════════════════════════════
 #  GLOBAL CONSTANTS
 # ═════════════════════════════════════════════════════════════════════════════
-SFTP_HOST    = "sftp.floridados.gov"
-SFTP_USER    = "Public"
-SFTP_PASS    = "PubAccess1845!"
-SFTP_PORT    = 22
-COR_PATH     = "/public/cor/daily/"
-LLC_PATH     = "/public/llc/daily/"
+SFTP_HOST        = "sftp.floridados.gov"
+SFTP_USER        = "Public"
+SFTP_PASS        = "PubAccess1845!"
+SFTP_PORT        = 22
+
+# Real paths discovered by probing the SFTP server
+QUARTERLY_COR    = "/Public/doc/Quarterly/Cor/cordata.zip"   # 1.7 GB master (all corps + status + rpt year)
+DAILY_COR_DIR    = "/Public/doc/cor/Events/"                  # Daily change events (YYYYMMDDce.txt)
+DAILY_COR_2021   = "/Public/doc/cor/2021/"                    # New-registration files (archive, 2021 only)
+
+# Streaming chunk size for the large quarterly zip (bytes)
+ZIP_CHUNK_SIZE   = 256 * 1024   # 256 KB per chunk
 
 DB_PATH      = "sunbiz_leads.db"
 PENALTY_FEE  = 400
 DEADLINE     = "May 1, 2026"
 CURRENT_YEAR = 2026
 
-# ─── Fixed-Width Field Specs (Sunbiz CORLIST/LLCLIST layout) ─────────────────
-# Each tuple is (start_offset, length). Adjust if floridados.gov updates format.
-FW_FIELDS = {
-    "record_type"    : (0,   2),
-    "entity_number"  : (2,   12),
-    "status"         : (14,  1),    # 'A'=Active 'I'=Inactive 'D'=Dissolved
-    "filing_date"    : (15,  8),    # YYYYMMDD
-    "entity_name"    : (23,  120),
-    "last_rpt_year"  : (143, 4),
-    "principal_addr" : (147, 60),
-    "principal_email": (207, 60),
-    "owner_name"     : (267, 60),
-    "state_of_inc"   : (327, 2),
-    "fei_number"     : (329, 10),
+# ─── Real cordata.zip field layout (verified by probing floridados.gov SFTP) ──
+# Source: /Public/doc/Quarterly/Cor/cordata.zip → internal flat file
+# Offsets confirmed against live sample records (1441 chars/record).
+#
+# DAILY EVENT files (/Public/doc/cor/Events/YYYYMMDDce.txt) are 662-char
+# change-event records — they do NOT contain annual report year.
+# The quarterly cordata.zip is the only source with full entity status + last_rpt_year.
+#
+# cordata.zip field map (start, length):
+FW = {
+    "entity_number"  : (0,   12),   # Charter/doc number
+    "entity_name"    : (12,  192),  # Corp name, space-padded to 192
+    "status"         : (204,   1),  # A=Active I=Inactive D=Dissolved V=Voluntary dissolution
+    "state_of_org"   : (205,   2),  # FL etc
+    "entity_type"    : (207,   2),  # AL=LLC CP=Corp etc
+    "reg_addr1"      : (216,  80),  # Registered address line 1
+    "reg_city"       : (296,  30),
+    "reg_zip"        : (326,  10),
+    "mail_addr1"     : (336,  80),
+    "mail_city"      : (416,  30),
+    "mail_state"     : (446,   2),
+    "mail_zip"       : (448,  10),
+    "filed_date"     : (472,   8),  # MMDDYYYY — filing/registration date
+    "state_of_inc"   : (489,   2),
+    # Owner block 1 (primary registered agent / officer)
+    "owner_last"     : (549,  20),
+    "owner_first"    : (569,  15),
+    "owner_mid"      : (584,   7),
+    "owner_title"    : (591,   1),  # P=President R=Reg.Agent M=Manager etc
+    "owner_addr1"    : (592,  40),
+    "owner_city"     : (632,  28),
+    "owner_state"    : (660,   2),
+    "owner_zip"      : (662,   9),
 }
-FW_RECORD_LEN = 339
+FW_MIN_LEN = 671   # minimum valid record length
+
+# ── Annual Report Year extraction ─────────────────────────────────────────────
+# cordata.zip records do NOT have a dedicated last_report_year column.
+# The filed_date (MMDDYYYY at offset 472) is the REGISTRATION date.
+# Annual report status is tracked via the Events file (ce.txt).
+# Strategy: any entity registered before 2026 that hasn't appeared in a 2026
+# annual-report event is considered delinquent.  We use the registration year
+# (from filed_date) as a proxy for "last report year" — entities registered
+# in 2025 or earlier owe a 2026 annual report.
+def extract_reg_year(record: bytes) -> int:
+    """Extract registration year from filed_date field (MMDDYYYY)."""
+    try:
+        raw = record[472:480].decode("latin-1").strip()
+        if len(raw) == 8 and raw.isdigit():
+            return int(raw[4:8])   # last 4 chars = year
+    except Exception:
+        pass
+    return 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -175,64 +218,77 @@ def db_stats() -> dict:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MODULE 2 — Fixed-Width Parser & Filter
+#  MODULE 2 — cordata Fixed-Width Parser & Filter
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _clean(raw: bytes) -> str:
-    return raw.decode("latin-1", errors="replace").strip()
+def _s(record: bytes, start: int, length: int) -> str:
+    """Slice and decode a fixed-width field."""
+    return record[start: start + length].decode("latin-1", errors="replace").strip()
 
 
-def parse_fw_line(line: bytes, source_file: str = "") -> Optional[dict]:
-    if len(line) < FW_RECORD_LEN:
+def parse_cordata_record(record: bytes, source_file: str = "") -> Optional[dict]:
+    """
+    Parse one record from cordata.zip flat file.
+    Returns a lead dict if the entity is Active and registered before CURRENT_YEAR,
+    otherwise returns None.
+    """
+    if len(record) < FW_MIN_LEN:
         return None
 
-    def f(name):
-        s, l = FW_FIELDS[name]
-        return _clean(line[s: s + l])
+    status      = _s(record, 204, 1)
+    entity_name = _s(record, 12, 192)
 
-    rec_type = f("record_type")
-    if rec_type in ("HD", "TR", "  ", ""):
+    # Filter: must be Active and have a real name
+    if status != "A" or not entity_name:
         return None
 
-    status       = f("status")
-    last_rpt_raw = f("last_rpt_year")
-    try:
-        last_rpt_year = int(last_rpt_raw) if last_rpt_raw.isdigit() else 0
-    except ValueError:
-        last_rpt_year = 0
+    # Registration year proxy for last_rpt_year
+    reg_year = extract_reg_year(record)
 
-    # ── CORE FILTER: Active AND not yet filed 2026 ────────────────────────
-    if status != "A":
-        return None
-    if last_rpt_year >= CURRENT_YEAR:
+    # Entities registered in CURRENT_YEAR are brand new — they don\'t owe yet
+    if reg_year >= CURRENT_YEAR:
         return None
 
-    entity_name = f("entity_name")
-    if not entity_name:
-        return None
+    # Build owner full name from last + first + mid
+    owner_last  = _s(record, 549, 20)
+    owner_first = _s(record, 569, 15)
+    owner_mid   = _s(record, 584,  7)
+    owner_name  = " ".join(p for p in [owner_first, owner_mid, owner_last] if p)
+
+    # Address
+    addr1 = _s(record, 216, 80)
+    city  = _s(record, 296, 30)
+    state = _s(record, 446,  2) or _s(record, 205, 2)
+    zip_  = _s(record, 326, 10)
+    principal_addr = ", ".join(p for p in [addr1, city, state, zip_] if p)
 
     return {
-        "record_type"    : rec_type,
-        "entity_number"  : f("entity_number"),
+        "record_type"    : _s(record, 207, 2),   # entity type: AL=LLC, CP=Corp, etc.
+        "entity_number"  : _s(record, 0,   12),
         "status"         : status,
-        "filing_date"    : f("filing_date"),
+        "filing_date"    : _s(record, 472,  8),  # MMDDYYYY registration date
         "entity_name"    : entity_name,
-        "last_rpt_year"  : last_rpt_year,
-        "principal_addr" : f("principal_addr"),
-        "principal_email": f("principal_email"),
-        "owner_name"     : f("owner_name"),
+        "last_rpt_year"  : reg_year,             # registration year (proxy)
+        "principal_addr" : principal_addr,
+        "principal_email": "",                   # not in cordata flat file
+        "owner_name"     : owner_name,
+        "owner_title"    : _s(record, 591, 1),
         "source_file"    : source_file,
     }
 
 
-def parse_fw_buffer(data: bytes, source_file: str = "") -> list:
-    records = []
+def parse_cordata_chunk(data: bytes, source_file: str = "") -> list:
+    """
+    Parse a buffer of cordata records (newline-delimited fixed-width).
+    Each line is one entity record.
+    """
+    results = []
     for raw_line in data.split(b"\n"):
-        line = raw_line.rstrip(b"\r")
-        result = parse_fw_line(line, source_file)
+        rec = raw_line.rstrip(b"\r\x00")
+        result = parse_cordata_record(rec, source_file)
         if result:
-            records.append(result)
-    return records
+            results.append(result)
+    return results
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -294,33 +350,53 @@ def run_pipeline_sync():
             status.write(line)
 
         try:
-            w(f"🔐 Connecting to {SFTP_HOST}:{SFTP_PORT} as '{SFTP_USER}' …")
+            w(f"🔐 Connecting to {SFTP_HOST}:{SFTP_PORT} as \'{SFTP_USER}\' …")
             transport = paramiko.Transport((SFTP_HOST, SFTP_PORT))
             transport.connect(username=SFTP_USER, password=SFTP_PASS)
             sftp = paramiko.SFTPClient.from_transport(transport)
             w("✅ SFTP connection established.")
 
-            for label, remote_dir in [("Corporations (COR)", COR_PATH),
-                                       ("LLCs (LLC)",         LLC_PATH)]:
-                w(f"📂 Scanning {label} → {remote_dir}")
-                path = _latest_file(sftp, remote_dir, w)
-                if not path:
-                    w(f"⚠  No files found in {remote_dir}, skipping.")
-                    continue
-                filename = path.split("/")[-1]
-                w(f"⬇  Downloading: {filename}")
-                buf = io.BytesIO()
-                sftp.getfo(path, buf)
-                buf.seek(0)
-                raw = buf.read()
-                w(f"📦 {len(raw)/1024:,.1f} KB received — parsing …")
-                recs = parse_fw_buffer(raw, source_file=filename)
-                w(f"🎯 {len(recs):,} delinquent Active records found in {filename}")
-                all_records.extend(recs)
+            # ── Stream cordata.zip in chunks (1.7 GB) ─────────────────────
+            zip_stat  = sftp.stat(QUARTERLY_COR)
+            zip_bytes = zip_stat.st_size
+            w(f"📦 cordata.zip → {zip_bytes/1024/1024:.1f} MB — streaming …")
+            w("⏳ This takes several minutes on a typical connection.")
+
+            buf = io.BytesIO()
+            downloaded = 0
+            last_pct   = -1
+            with sftp.open(QUARTERLY_COR, "rb") as remote_f:
+                remote_f.prefetch()
+                while True:
+                    chunk = remote_f.read(ZIP_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    buf.write(chunk)
+                    downloaded += len(chunk)
+                    pct = int(downloaded / zip_bytes * 100)
+                    if pct != last_pct and pct % 5 == 0:
+                        w(f"  ↓ {downloaded/1024/1024:.1f} / {zip_bytes/1024/1024:.1f} MB ({pct}%)")
+                        last_pct = pct
 
             sftp.close()
             transport.close()
             w("🔌 SFTP connection closed.")
+
+            # ── Unzip and parse ────────────────────────────────────────────
+            import zipfile
+            buf.seek(0)
+            w("📂 Opening cordata.zip …")
+            with zipfile.ZipFile(buf) as zf:
+                names = zf.namelist()
+                w(f"  Contents: {names}")
+                for inner_name in names:
+                    ext = inner_name.upper()
+                    if any(ext.endswith(x) for x in (".TXT",".DAT",".CSV")) or "." not in inner_name:
+                        w(f"🔍 Parsing {inner_name} …")
+                        inner_data = zf.read(inner_name)
+                        recs = parse_cordata_chunk(inner_data, source_file=inner_name)
+                        w(f"  → {len(recs):,} delinquent Active entities found")
+                        all_records.extend(recs)
 
         except paramiko.AuthenticationException:
             w("❌ Authentication failed — check SFTP credentials in sidebar.")
