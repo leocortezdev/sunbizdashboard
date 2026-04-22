@@ -12,6 +12,7 @@ import time
 import sqlite3
 import textwrap
 import random
+import threading
 from datetime import datetime, date
 from typing import Optional
 
@@ -313,6 +314,106 @@ def db_get_ungoogled(limit: int = 50) -> list:
     return [dict(r) for r in rows]
 
 
+def db_delete_lead(entity_number: str, reason: str = ""):
+    """Permanently remove a lead from the database."""
+    with db_connect() as conn:
+        conn.execute("DELETE FROM leads WHERE entity_number = ?", (entity_number,))
+        conn.commit()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BACKGROUND ENRICHMENT ENGINE
+#  Runs silently in a daemon thread — no user interaction needed.
+#  Writes directly to SQLite. UI polls and refreshes automatically.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Shared state between background thread and Streamlit UI
+_BG = {
+    "running"      : False,
+    "current"      : "",      # entity name being checked right now
+    "checked"      : 0,
+    "removed"      : 0,
+    "emails_found" : 0,
+    "phones_found" : 0,
+    "last_action"  : "",      # last thing that happened (for live log)
+}
+_BG_LOCK = threading.Lock()
+
+
+def _bg_enrich_worker(delay_sec: float = 2.0):
+    """
+    Background daemon thread.
+    Continuously pulls unenriched leads from SQLite, checks Sunbiz live,
+    deletes inactive ones, saves contact info for active ones.
+    Stops automatically when all leads are enriched.
+    """
+    while True:
+        leads = db_get_unenriched(limit=1)  # one at a time — steady trickle
+        if not leads:
+            with _BG_LOCK:
+                _BG["running"]   = False
+                _BG["current"]   = ""
+                _BG["last_action"] = "✅ All leads checked — enrichment complete"
+            break
+
+        lead       = leads[0]
+        entity_num = lead["entity_number"]
+        entity_name = lead["entity_name"]
+
+        with _BG_LOCK:
+            _BG["current"] = entity_name
+
+        data = scrape_sunbiz_entity(entity_num)
+
+        with _BG_LOCK:
+            _BG["checked"] += 1
+
+            if not data["page_found"] or data["is_inactive"]:
+                # Delete silently — it just disappears from the table
+                reason = data.get("live_status") or "Not found / Inactive"
+                db_delete_lead(entity_num, reason=reason)
+                _BG["removed"]    += 1
+                _BG["last_action"] = f"🗑 Removed: {entity_name[:40]} ({reason})"
+            else:
+                db_enrich_lead(entity_num, data.get("email",""), data.get("phone",""))
+                if data.get("email"):    _BG["emails_found"] += 1
+                if data.get("phone"):    _BG["phones_found"] += 1
+                action = []
+                if data.get("email"):  action.append(f"✉ {data['email']}")
+                if data.get("phone"):  action.append(f"📞 {data['phone']}")
+                _BG["last_action"] = f"✅ {entity_name[:35]} — " + (", ".join(action) if action else "no contact info")
+
+        time.sleep(delay_sec)
+
+    with _BG_LOCK:
+        _BG["running"] = False
+
+
+def start_bg_enrichment(delay_sec: float = 2.0):
+    """Start background enrichment if not already running."""
+    with _BG_LOCK:
+        if _BG["running"]:
+            return False   # already running
+        _BG["running"]       = True
+        _BG["current"]       = ""
+        _BG["last_action"]   = "Starting…"
+
+    t = threading.Thread(
+        target=_bg_enrich_worker,
+        args=(delay_sec,),
+        daemon=True,
+        name="sunbiz-bg-enrichment",
+    )
+    t.start()
+    return True
+
+
+def bg_status() -> dict:
+    """Thread-safe snapshot of background enrichment state."""
+    with _BG_LOCK:
+        return dict(_BG)
+
+
 def db_get_unenriched(limit: int = 50) -> list:
     """Return entity numbers that haven't been enriched yet."""
     with db_connect() as conn:
@@ -470,14 +571,29 @@ _SCRAPE_HEADERS = {
 }
 
 
+# Status words on Sunbiz that mean the business is NOT active
+_INACTIVE_STATUSES = {
+    "inactive", "dissolved", "revoked", "cancelled", "withdrawn",
+    "administratively dissolved", "voluntarily dissolved",
+    "merged", "converted", "expired",
+}
+
 def scrape_sunbiz_entity(entity_number: str) -> dict:
     """
     Scrape the Sunbiz detail page for a single entity number.
-    Returns dict with keys: email, phone, registered_agent, last_report_year, status.
-    All values default to empty string if not found.
+    Returns dict with keys:
+      email, phone, registered_agent, last_report_year,
+      live_status, is_inactive, page_found
+    live_status — the exact status string from the Sunbiz page
+    is_inactive — True if the business is not currently active
+    page_found  — False if entity doesn't exist on Sunbiz at all
     """
-    result = {"email": "", "phone": "", "registered_agent": "",
-              "last_report_year": "", "principal_name": ""}
+    import re
+    result = {
+        "email": "", "phone": "", "registered_agent": "",
+        "last_report_year": "", "live_status": "",
+        "is_inactive": False, "page_found": True,
+    }
     try:
         params = {
             "inquirytype": "DocumentNumber",
@@ -490,44 +606,56 @@ def scrape_sunbiz_entity(entity_number: str) -> dict:
             headers=_SCRAPE_HEADERS, timeout=12
         )
         if resp.status_code != 200:
+            result["page_found"] = False
             return result
 
         soup = BeautifulSoup(resp.text, "html.parser")
+        page_text = soup.get_text(" ")
+
+        # ── Check if entity exists at all ─────────────────────────────────
+        if "no records found" in page_text.lower() or len(page_text.strip()) < 200:
+            result["page_found"] = False
+            result["is_inactive"] = True
+            return result
+
+        # ── Live status — most important field ────────────────────────────
+        # Sunbiz shows "Status: Active" or "Status: Inactive" etc.
+        status_match = re.search(
+            r'Status[:\s]+([A-Za-z ]+?)(?:\n|<|\|)',
+            page_text, re.IGNORECASE
+        )
+        if status_match:
+            raw_status = status_match.group(1).strip().lower()
+            result["live_status"] = raw_status.title()
+            # Mark inactive if any inactive keyword found
+            result["is_inactive"] = any(s in raw_status for s in _INACTIVE_STATUSES)
+        
+        # Also check page for inactive keywords anywhere prominent
+        if not result["is_inactive"]:
+            for kw in _INACTIVE_STATUSES:
+                if kw in page_text.lower():
+                    result["is_inactive"] = True
+                    result["live_status"] = result["live_status"] or kw.title()
+                    break
 
         # ── Annual report year ────────────────────────────────────────────
-        # Appears in a span or td next to "Annual Reports" label
-        for label in soup.find_all(["span", "td", "th"]):
-            txt = label.get_text(strip=True).lower()
-            if "annual report" in txt:
-                # Year is usually in the next sibling or table row
-                nxt = label.find_next_sibling()
-                if nxt:
-                    yr_txt = nxt.get_text(strip=True)
-                    import re
-                    yr_match = re.search(r'20\d{2}', yr_txt)
-                    if yr_match:
-                        result["last_report_year"] = yr_match.group()
-                break
+        yr_matches = re.findall(r'Annual Report.*?20(\d{2})', page_text, re.IGNORECASE)
+        if yr_matches:
+            result["last_report_year"] = "20" + yr_matches[-1]
 
-        # ── Officers / registered agent section ──────────────────────────
-        # Look for email patterns anywhere on the page
-        import re
-        page_text = soup.get_text(" ")
-        
-        # Email — find anything that looks like an email
+        # ── Email ─────────────────────────────────────────────────────────
+        skip_domains = {"sunbiz.org", "dos.myflorida.com", "floridados.gov",
+                        "myfloridacfo.com", "dor.myflorida.com"}
         email_matches = re.findall(
             r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}',
             page_text
         )
-        # Filter out Florida DOS system emails
-        skip_domains = {"sunbiz.org", "dos.myflorida.com", "floridados.gov", "myfloridacfo.com"}
         for em in email_matches:
-            domain = em.split("@")[-1].lower()
-            if domain not in skip_domains:
+            if em.split("@")[-1].lower() not in skip_domains:
                 result["email"] = em.lower()
                 break
 
-        # Phone — look for (XXX) XXX-XXXX or XXX-XXX-XXXX patterns
+        # ── Phone ─────────────────────────────────────────────────────────
         phone_matches = re.findall(
             r'\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}',
             page_text
@@ -535,20 +663,17 @@ def scrape_sunbiz_entity(entity_number: str) -> dict:
         if phone_matches:
             result["phone"] = phone_matches[0].strip()
 
-        # Registered agent name
+        # ── Registered agent ──────────────────────────────────────────────
         for label in soup.find_all(string=re.compile("Registered Agent", re.I)):
             parent = label.parent
             if parent:
-                # Name is usually in the next row/span
-                nxt = parent.find_next("span", class_=re.compile("value|data", re.I))
-                if not nxt:
-                    nxt = parent.find_next_sibling()
+                nxt = parent.find_next_sibling()
                 if nxt:
                     result["registered_agent"] = nxt.get_text(strip=True)[:80]
             break
 
     except requests.exceptions.Timeout:
-        pass
+        result["page_found"] = False
     except Exception:
         pass
 
@@ -574,6 +699,8 @@ def run_enrichment_sync(batch_size: int = 50, delay_sec: float = 1.5):
             return
 
         found_email = found_phone = 0
+        removed     = 0
+        not_found   = 0
 
         for i, lead in enumerate(leads):
             entity_num  = lead["entity_number"]
@@ -581,6 +708,29 @@ def run_enrichment_sync(batch_size: int = 50, delay_sec: float = 1.5):
 
             w(f"🔍 [{i+1}/{len(leads)}] {entity_name} ({entity_num})")
             data = scrape_sunbiz_entity(entity_num)
+
+            # ── Status check — clean DB in real time ──────────────────────
+            if not data["page_found"]:
+                db_delete_lead(entity_num, reason="Not found on Sunbiz")
+                not_found += 1
+                removed   += 1
+                w(f"  🗑  Not found on Sunbiz — removed from database")
+                if i < len(leads) - 1:
+                    time.sleep(delay_sec)
+                continue
+
+            if data["is_inactive"]:
+                status_label = data.get("live_status") or "Inactive/Dissolved"
+                db_delete_lead(entity_num, reason=status_label)
+                removed += 1
+                w(f"  🗑  Status: {status_label} — removed from database")
+                if i < len(leads) - 1:
+                    time.sleep(delay_sec)
+                continue
+
+            # ── Active — save contact info ────────────────────────────────
+            live_status = data.get("live_status", "")
+            w(f"  ✅ Status: {live_status or 'Active'}")
 
             if data["email"]:
                 found_email += 1
@@ -593,15 +743,20 @@ def run_enrichment_sync(batch_size: int = 50, delay_sec: float = 1.5):
 
             db_enrich_lead(entity_num, data["email"], data["phone"])
 
-            # Polite delay — don't hammer the state server
             if i < len(leads) - 1:
                 time.sleep(delay_sec)
 
         w(f"")
-        w(f"✅ Enrichment complete — {found_email} emails, {found_phone} phones found")
-        w(f"   Hit rate: {(found_email/len(leads)*100):.0f}% email  |  {(found_phone/len(leads)*100):.0f}% phone")
+        kept = len(leads) - removed
+        w(f"✅ Enrichment complete")
+        w(f"   ✉  Emails found:    {found_email}")
+        w(f"   📞 Phones found:    {found_phone}")
+        w(f"   🗑  Removed (inactive/not found): {removed}")
+        w(f"   ✅ Active leads kept: {kept}")
+        if kept > 0:
+            w(f"   Email hit rate: {(found_email/kept*100):.0f}%")
         status.update(
-            label=f"✅ Enriched {len(leads)} leads — {found_email} emails, {found_phone} phones",
+            label=f"✅ {kept} active leads kept · {removed} inactive removed · {found_email} emails found",
             state="complete", expanded=False
         )
 
@@ -965,12 +1120,15 @@ def run_pipeline_sync():
         else:
             w("ℹ  No new delinquent records found.")
 
-        w("🏁 Pipeline complete.")
+        w("🏁 Pipeline complete — starting background enrichment…")
         status.update(label="✅ Pipeline complete", state="complete", expanded=False)
 
     st.session_state.pipeline_logs     = logs
     st.session_state.pipeline_complete = True
     st.session_state.last_pipeline_run = datetime.now().strftime("%b %d, %Y at %I:%M %p")
+
+    # Auto-start silent background enrichment immediately after pipeline
+    start_bg_enrichment(delay_sec=2.0)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1195,9 +1353,19 @@ with st.sidebar:
     delay_sec   = st.slider("Delay Between Sends (s)", 0, 10, 2)
 
     st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>ENRICHMENT</div>', unsafe_allow_html=True)
-    enrich_batch  = st.slider("Sunbiz batch size", 10, 200, 50)
-    enrich_delay  = st.slider("Sunbiz delay (s)", 0.5, 5.0, 1.5, step=0.5)
-    st.caption("Scrapes Sunbiz detail pages for emails & phones.")
+    bg_now = bg_status()
+    enrich_delay_s = st.slider("Delay between checks (s)", 1.0, 5.0, 2.0, step=0.5,
+                                key="enrich_delay_s",
+                                help="Lower = faster but more load on Sunbiz servers")
+    if bg_now["running"]:
+        st.markdown('<span style="color:#4caf7d;font-size:.8rem;font-family:monospace;">● Running in background…</span>', unsafe_allow_html=True)
+        st.caption(f"Checked: {bg_now['checked']} · Removed: {bg_now['removed']}")
+    else:
+        if st.button("▶ Start Background Enrichment", use_container_width=True,
+                     help="Silently checks every lead against Sunbiz live status"):
+            start_bg_enrichment(delay_sec=enrich_delay_s)
+            st.rerun()
+    st.caption("Runs silently in background. Inactive leads deleted automatically.")
 
     st.markdown('<div class="sh" style="margin-top:0.75rem;"><span class="dot"></span>GOOGLE ENRICHMENT</div>', unsafe_allow_html=True)
     serp_api_key  = st.text_input("SerpAPI Key (optional)", type="password",
@@ -1251,12 +1419,6 @@ with hc2:
         use_container_width=True,
         help="SFTP download → parse fixed-width → filter delinquents → SQLite upsert",
     )
-    enrich_btn = st.button(
-        "🔍  Enrich Contacts",
-        type="secondary",
-        use_container_width=True,
-        help="Scrape Sunbiz pages for emails & phone numbers",
-    )
     google_btn = st.button(
         "🌐  Google Search",
         type="secondary",
@@ -1266,10 +1428,6 @@ with hc2:
 
 if run_btn:
     run_pipeline_sync()
-    st.rerun()
-
-if enrich_btn:
-    run_enrichment_sync(batch_size=enrich_batch, delay_sec=enrich_delay)
     st.rerun()
 
 if google_btn:
@@ -1314,6 +1472,47 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ── Background enrichment status strip ───────────────────────────────────────
+bg = bg_status()
+if bg["running"]:
+    checked  = bg["checked"]
+    removed  = bg["removed"]
+    last_act = bg["last_action"]
+    current  = bg["current"]
+    st.markdown(f"""
+    <div style="background:#0d1a12;border:1px solid #2d5a3d;border-left:3px solid #4caf7d;
+                border-radius:4px;padding:.6rem 1rem;margin-bottom:1rem;
+                display:flex;justify-content:space-between;align-items:center;gap:1rem;">
+        <div>
+            <span style="font-size:.7rem;color:#4caf7d;font-weight:700;
+                         text-transform:uppercase;letter-spacing:.1em;font-family:'IBM Plex Mono',monospace;">
+                ● ENRICHMENT RUNNING
+            </span>
+            <span style="font-size:.78rem;color:#a8b4c0;margin-left:.75rem;">
+                {last_act}
+            </span>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;white-space:nowrap;">
+            {checked} checked · {removed} removed
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    # Auto-refresh every 3 seconds while background enrichment is running
+    time.sleep(3)
+    st.rerun()
+elif bg["checked"] > 0:
+    # Show summary after enrichment finishes
+    st.markdown(f"""
+    <div style="background:#0d1117;border:1px solid #2a2f38;border-radius:4px;
+                padding:.5rem 1rem;margin-bottom:1rem;">
+        <span style="font-size:.72rem;color:#5a6472;font-family:'IBM Plex Mono',monospace;">
+            ✅ Last enrichment: {bg['checked']} checked · {bg['removed']} inactive removed ·
+            {bg['emails_found']} emails · {bg['phones_found']} phones found
+        </span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
