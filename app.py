@@ -333,15 +333,16 @@ def db_delete_lead(entity_number: str, reason: str = ""):
 
 # Shared state between background thread and Streamlit UI
 _BG = {
-    "running"      : False,
-    "current"      : "",
-    "checked"      : 0,
-    "removed"      : 0,
-    "emails_found" : 0,
-    "phones_found" : 0,
-    "last_action"  : "",
-    "log"          : [],      # rolling last-20 activity lines
-    "started_at"   : None,
+    "running"       : False,
+    "current"       : "",
+    "checked"       : 0,
+    "removed"       : 0,
+    "already_filed" : 0,
+    "emails_found"  : 0,
+    "phones_found"  : 0,
+    "last_action"   : "",
+    "log"           : [],
+    "started_at"    : None,
 }
 
 def _bg_log(msg: str):
@@ -384,26 +385,41 @@ def _bg_enrich_worker(delay_sec: float = 2.0):
             _BG["checked"] += 1
 
             if not data["page_found"] or data["is_inactive"]:
+                # Business is gone — delete it
                 reason = data.get("live_status") or "Not found / Inactive"
                 db_delete_lead(entity_num, reason=reason)
                 _BG["removed"] += 1
-                _bg_log(f"🗑  REMOVED  {entity_name[:45]}  ({reason})")
+                _bg_log(f"🗑  REMOVED   {entity_name[:43]}  ({reason})")
+
+            elif data.get("already_filed"):
+                # Already filed their 2026 annual report — not a valid lead
+                yr = data.get("last_report_year", str(CURRENT_YEAR))
+                db_delete_lead(entity_num, reason=f"Already filed {yr} annual report")
+                _BG["removed"]       += 1
+                _BG["already_filed"] += 1
+                _bg_log(f"✅  FILED     {entity_name[:43]}  (filed {yr} — not a lead)")
+
             else:
+                # Active and hasn't filed yet — this is a real lead, save contact info
                 db_enrich_lead(entity_num, data.get("email",""), data.get("phone",""))
                 if data.get("email"):  _BG["emails_found"] += 1
                 if data.get("phone"):  _BG["phones_found"] += 1
-                parts = []
+                yr_info = f"last filed {data['last_report_year']}" if data.get("last_report_year") else "no report on file"
+                parts   = []
                 if data.get("email"):  parts.append(f"✉ {data['email']}")
                 if data.get("phone"):  parts.append(f"📞 {data['phone']}")
-                suffix = "  ·  " + "  ".join(parts) if parts else "  ·  no contact info"
-                _bg_log(f"✅  ACTIVE   {entity_name[:45]}{suffix}")
+                contact = "  ·  " + "  ".join(parts) if parts else "  ·  no contact info"
+                _bg_log(f"⚠   DELINQUENT {entity_name[:40]}  ({yr_info}){contact}")
 
         time.sleep(delay_sec)
 
     with _BG_LOCK:
         _BG["running"] = False
-        _bg_log(f"🏁 Complete — {_BG['checked']} checked, {_BG['removed']} removed, "
-                f"{_BG['emails_found']} emails, {_BG['phones_found']} phones")
+        filed = _BG["already_filed"]
+        _bg_log(f"🏁 Complete — {_BG['checked']} checked · "
+                f"{_BG['removed'] - filed} inactive removed · "
+                f"{filed} already filed 2026 (removed) · "
+                f"{_BG['emails_found']} emails · {_BG['phones_found']} phones")
 
 
 def start_bg_enrichment(delay_sec: float = 2.0):
@@ -617,6 +633,7 @@ def scrape_sunbiz_entity(entity_number: str) -> dict:
         "email": "", "phone": "", "registered_agent": "",
         "last_report_year": "", "live_status": "",
         "is_inactive": False, "page_found": True,
+        "already_filed": False,   # True if they've already filed CURRENT_YEAR report
     }
     try:
         params = {
@@ -1544,16 +1561,17 @@ st.markdown(f"""
 # ── Background enrichment live panel ─────────────────────────────────────────
 bg = bg_status()
 if bg["running"] or bg["checked"] > 0:
-    total    = bg["checked"]
-    removed  = bg["removed"]
-    kept     = total - removed
-    emails   = bg["emails_found"]
-    phones   = bg["phones_found"]
-    running  = bg["running"]
-    log_lines = bg.get("log", [])
-    started   = bg.get("started_at", "")
+    total         = bg["checked"]
+    removed       = bg["removed"]
+    already_filed = bg.get("already_filed", 0)
+    inactive_rm   = removed - already_filed
+    kept          = total - removed
+    emails        = bg["emails_found"]
+    phones        = bg["phones_found"]
+    running       = bg["running"]
+    log_lines     = bg.get("log", [])
+    started       = bg.get("started_at", "")
 
-    # ── Stat pills ──
     status_color = "#4caf7d" if running else "#5a6472"
     status_label = "● LIVE — CHECKING SUNBIZ" if running else "■ ENRICHMENT COMPLETE"
     pct_removed  = int(removed / total * 100) if total > 0 else 0
@@ -1565,7 +1583,7 @@ if bg["running"] or bg["checked"] > 0:
         <!-- Header bar -->
         <div style="background:#0d1f17;padding:.6rem 1.1rem;
                     display:flex;justify-content:space-between;align-items:center;
-                    border-bottom:1px solid #1e3a2a;">
+                    border-bottom:1px solid #1e3a2a;flex-wrap:wrap;gap:.5rem;">
             <div style="display:flex;align-items:center;gap:.6rem;">
                 <span style="font-size:.68rem;font-weight:700;color:{status_color};
                              text-transform:uppercase;letter-spacing:.12em;
@@ -1574,19 +1592,22 @@ if bg["running"] or bg["checked"] > 0:
                 </span>
                 {f'<span style="font-size:.68rem;color:#3d5a47;font-family:monospace;">started {started}</span>' if started else ''}
             </div>
-            <div style="display:flex;gap:1.25rem;">
+            <div style="display:flex;gap:1.1rem;flex-wrap:wrap;">
                 <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
                     <span style="color:#f0f4f8;font-weight:600;">{total}</span> checked
                 </span>
                 <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
-                    <span style="color:#e05252;font-weight:600;">{removed}</span> removed ({pct_removed}%)
+                    <span style="color:#e05252;font-weight:600;">{inactive_rm}</span> inactive
                 </span>
                 <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
-                    <span style="color:#4caf7d;font-weight:600;">{kept}</span> active
+                    <span style="color:#5b9cf6;font-weight:600;">{already_filed}</span> already filed {CURRENT_YEAR}
                 </span>
                 <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
-                    <span style="color:#5b9cf6;font-weight:600;">{emails}</span> emails ·
-                    <span style="color:#e8a020;font-weight:600;">{phones}</span> phones
+                    <span style="color:#4caf7d;font-weight:600;">{kept}</span> delinquent leads
+                </span>
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:.72rem;color:#5a6472;">
+                    <span style="color:#e8a020;font-weight:600;">{emails}</span>✉
+                    <span style="color:#e8a020;font-weight:600;">{phones}</span>📞
                 </span>
             </div>
         </div>
