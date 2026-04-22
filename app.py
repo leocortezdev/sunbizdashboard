@@ -543,33 +543,41 @@ def run_pipeline_sync():
             # ── Find the most recent daily registration files ──────────────
             # Files live in /Public/doc/cor/YYYY/ named YYYYMMDDc.txt
             # We look for the most recent available year folder then newest file
+            # ── All daily files live flat in /Public/doc/cor/ ─────────────
+            remote_dir = "/Public/doc/cor/"
+            attrs = sftp.listdir_attr(remote_dir)
+
+            # Keep only YYYYMMDDc.txt files, sort newest first
+            daily = sorted(
+                [a for a in attrs if a.filename.endswith("c.txt") and a.filename[:4].isdigit()],
+                key=lambda a: a.filename,
+                reverse=True,
+            )
+
+            w(f"📂 Found {len(daily):,} daily files in {remote_dir}")
+            w(f"   Newest: {daily[0].filename}  |  Oldest available: {daily[-1].filename}")
+
+            # How many files to download — configurable via sidebar
+            num_files = st.session_state.get("pipeline_num_files", 5)
+            target = daily[:num_files]
+            w(f"⬇  Downloading {len(target)} most recent files …")
+
             all_records_raw = []
-            for year in ["2021"]:   # expand to 2022+ if Florida adds more years
-                remote_dir = f"/Public/doc/cor/{year}/"
-                try:
-                    attrs = sftp.listdir_attr(remote_dir)
-                    attrs = [a for a in attrs if a.filename.endswith("c.txt")]
-                    if not attrs:
-                        continue
-                    attrs.sort(key=lambda a: a.filename, reverse=True)
-                    # Download the 3 most recent files to get a solid lead batch
-                    for attr in attrs[:3]:
-                        fname = attr.filename
-                        fpath = remote_dir + fname
-                        w(f"⬇  Downloading {fname} ({attr.st_size/1024:.0f} KB) …")
-                        buf = io.BytesIO()
-                        sftp.getfo(fpath, buf)
-                        buf.seek(0)
-                        raw = buf.read()
-                        recs = parse_file_buffer(raw, source_file=fname)
-                        w(f"  → {len(recs):,} leads from {fname}")
-                        all_records_raw.extend(recs)
-                except Exception as e:
-                    w(f"⚠  Could not read {remote_dir}: {e}")
+            for attr in target:
+                fname = attr.filename
+                fpath = remote_dir + fname
+                w(f"   {fname}  ({attr.st_size/1024:.0f} KB)")
+                buf = io.BytesIO()
+                sftp.getfo(fpath, buf)
+                buf.seek(0)
+                recs = parse_file_buffer(buf.read(), source_file=fname)
+                w(f"   → {len(recs):,} records parsed")
+                all_records_raw.extend(recs)
 
             sftp.close()
             transport.close()
             w("🔌 SFTP connection closed.")
+            w(f"✅ Total raw records: {len(all_records_raw):,}")
             all_records = all_records_raw
 
         except paramiko.AuthenticationException:
@@ -811,7 +819,12 @@ with st.sidebar:
     st.caption("Set `RESEND_API_KEY` or `SENDGRID_API_KEY` env var to enable real sends.")
     st.text_input("From Address", placeholder="you@yourdomain.com", key="from_email")
 
-    st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>LIMITS</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sh" style="margin-top:1rem;"><span class="dot"></span>PIPELINE SETTINGS</div>', unsafe_allow_html=True)
+    pipeline_num_files = st.slider("Files to download per run", 1, 30, 5, key="pipeline_num_files",
+                                    help="Each file = ~1 day of new FL registrations (~2,500 businesses)")
+    st.caption(f"≈ {pipeline_num_files * 2500:,} businesses per run")
+
+    st.markdown('<div class="sh" style="margin-top:0.75rem;"><span class="dot"></span>EMAIL LIMITS</div>', unsafe_allow_html=True)
     daily_limit = st.slider("Daily Send Limit", 10, 500, 100)
     delay_sec   = st.slider("Delay Between Sends (s)", 0, 10, 2)
 
